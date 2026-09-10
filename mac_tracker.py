@@ -27,7 +27,16 @@ GEREKSINIMLER
     - Switch'lerde read-only SNMP erisimi (v2c community ya da v3 kullanici).
     - Python 3.9+ ve SQLite 3.24+ (UPSERT icin; Python 3.9 ile gelen surum yeterli).
 
-MAC TABLOSU OKUMA YONTEMLERI (--mode)
+VERI KAYNAGI (--collector)
+    snmp : Varsayilan. Asagidaki --mode yontemleriyle FDB'yi SNMP ile okur.
+    ssh  : Cihaza SSH ile baglanip 'show mac address-table' ciktisini parse
+           eder. VLAN + MAC + port'u tek komutta verir, hicbir MIB destegine
+           ihtiyac duymaz. Bazi platformlarda (ornegin EVE-NG/GNS3'teki IOL
+           imajlari) Q-BRIDGE MIB yoktur, 'community@vlan' indexlemesi ve
+           VLAN context'leri de calismaz -- orada tek calisan yol budur.
+           paramiko gerektirir: pip3 install paramiko
+
+MAC TABLOSU OKUMA YONTEMLERI (--mode, sadece --collector snmp icin)
     dot1q  : Standart Q-BRIDGE MIB (dot1qTpFdbPort). VLAN bilgisi OID
              index'inde geldigi icin TEK walk ile butun VLAN'lari verir.
              Marka bagimsizdir ve hizlidir. VARSAYILAN tercih.
@@ -60,6 +69,10 @@ KULLANIM
 
     2) Ilk deneme (hatalari gormek icin tek seferlik + ayrintili cikti):
          python mac_tracker.py --once -v
+
+       SNMP ile FDB okunamiyorsa (IOL/IOU gibi kisitli imajlar) SSH yolu:
+         export MACTRACK_SSH_PASS='...'
+         python mac_tracker.py --once -v --collector ssh --ssh-user admin
 
     3) Surekli toplama -- ONERILEN YOL: Python'u acik tutmak yerine --once
        modunu cron / Task Scheduler ile her 1-2 dakikada bir calistir. Her
@@ -94,6 +107,7 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -277,6 +291,8 @@ class SwitchEntry:
     vlans: list[int] = field(default_factory=list)
     label: str = ""                               # raporlarda gorunen ad
     version: str = "2c"                           # "2c" | "3"
+    ssh_user: str = ""                            # SSH toplayicisi icin (opsiyonel)
+    ssh_pass: str = ""                            # tercihen envantere degil ortama koy
 
     def __post_init__(self):
         if not self.label:
@@ -354,6 +370,8 @@ def parse_inventory_csv(path: str) -> list[SwitchEntry]:
                     vlans=vlans,
                     label=row.get("label", ""),
                     version=version,
+                    ssh_user=row.get("ssh_user", ""),
+                    ssh_pass=row.get("ssh_pass", ""),
                 )
             )
     if not entries:
@@ -667,10 +685,18 @@ def snmp_walk(entry: SwitchEntry, opts: SnmpOptions, oid: str,
     return pairs
 
 
-def get_bridgeport_to_ifindex(entry: SwitchEntry, opts: SnmpOptions) -> dict[int, int]:
-    """dot1dBasePortIfIndex: bridge-port -> ifIndex."""
+def get_bridgeport_to_ifindex(entry: SwitchEntry, opts: SnmpOptions,
+                              vlan: int | None = None) -> dict[int, int]:
+    """
+    dot1dBasePortIfIndex: bridge-port -> ifIndex.
+
+    DIKKAT: Cisco'da bu tablo da VLAN context'ine baglidir -- varsayilan
+    community sana yalnizca VLAN 1'deki portlari verir ve bridge-port
+    numaralari VLAN'dan VLAN'a farkli olabilir. Bu yuzden dot1d modunda
+    harita, FDB ile AYNI VLAN context'i icinde okunmalidir.
+    """
     mapping: dict[int, int] = {}
-    for oid, value in snmp_walk(entry, opts, OID_DOT1D_BASEPORT_IFINDEX):
+    for oid, value in snmp_walk(entry, opts, OID_DOT1D_BASEPORT_IFINDEX, vlan=vlan):
         bridgeport = safe_int(oid.split(".")[-1])
         ifindex = safe_int(value)
         if bridgeport is None or ifindex is None:
@@ -717,14 +743,22 @@ def _status_map(entry: SwitchEntry, opts: SnmpOptions, oid: str, with_vlan: bool
     return statuses
 
 
-def fdb_dot1q(entry: SwitchEntry, opts: SnmpOptions,
-              filter_learned: bool) -> list[tuple[int, str, int]]:
+def resolve_port_name(bridgeport: int, portmap: dict[int, int],
+                      ifnames: dict[int, str]) -> str:
+    """bridge-port -> ifIndex -> 'Gi1/0/5'. Cozulemezse tanimlayici bir yedek ad."""
+    ifindex = portmap.get(bridgeport)
+    if ifindex is None:
+        return f"bridgeport{bridgeport}"
+    return ifnames.get(ifindex, f"ifIndex{ifindex}")
+
+
+def fdb_dot1q(entry: SwitchEntry, opts: SnmpOptions, filter_learned: bool,
+              portmap: dict[int, int], ifnames: dict[int, str]) -> list[Observation]:
     """
-    Standart Q-BRIDGE okuma: tek walk, tum VLAN'lar.
-    Doner: [(vlan, mac, bridgeport), ...]
+    Standart Q-BRIDGE okuma: tek walk, tum VLAN'lar (VLAN, OID index'inde).
     """
     statuses = _status_map(entry, opts, OID_DOT1Q_FDB_STATUS, with_vlan=True) if filter_learned else {}
-    rows: list[tuple[int, str, int]] = []
+    observations: list[Observation] = []
     for oid, value in snmp_walk(entry, opts, OID_DOT1Q_FDB_PORT):
         try:
             vlan, mac = mac_from_oid_suffix(oid, with_vlan=True)
@@ -737,20 +771,32 @@ def fdb_dot1q(entry: SwitchEntry, opts: SnmpOptions,
             continue
         if statuses and statuses.get((vlan, mac), FDB_STATUS_LEARNED) != FDB_STATUS_LEARNED:
             continue
-        rows.append((vlan or 0, mac, bridgeport))
-    return rows
+        observations.append(
+            Observation(mac=mac, vlan=vlan or 0,
+                        port=resolve_port_name(bridgeport, portmap, ifnames))
+        )
+    return observations
 
 
-def fdb_dot1d(entry: SwitchEntry, opts: SnmpOptions,
-              filter_learned: bool) -> list[tuple[int, str, int]]:
+def fdb_dot1d(entry: SwitchEntry, opts: SnmpOptions, filter_learned: bool,
+              ifnames: dict[int, str], verbose: bool = False) -> list[Observation]:
     """
-    Klasik BRIDGE MIB okuma. VLAN bilgisi olmadigi icin VLAN basina ayri
-    sorgu gerekir (Cisco: community@vlan / v3 context). Envanterde 'vlans'
-    bos ise VLAN'siz tek bir okuma yapilir (vlan=0 kaydedilir).
+    Klasik BRIDGE MIB okuma. VLAN bilgisi tasimadigi icin VLAN basina ayri
+    sorgu gerekir (Cisco: v2c'de community@vlan, v3'te vlan-<id> context).
+
+    Bridge-port haritasi da her VLAN icin AYRI okunur: Cisco'da bu tablo
+    VLAN context'ine bagli ve numaralar VLAN'dan VLAN'a degisebiliyor.
+    Envanterde 'vlans' bos ise VLAN'siz tek okuma yapilir (vlan=0).
     """
-    rows: list[tuple[int, str, int]] = []
+    observations: list[Observation] = []
     vlan_list: list[int | None] = list(entry.vlans) if entry.vlans else [None]
     for vlan in vlan_list:
+        try:
+            portmap = get_bridgeport_to_ifindex(entry, opts, vlan=vlan)
+        except SnmpError as exc:
+            print(f"  [!] {entry.label} vlan={vlan}: bridge-port haritasi okunamadi: {exc}",
+                  file=sys.stderr)
+            portmap = {}
         statuses = (
             _status_map(entry, opts, OID_DOT1D_FDB_STATUS, with_vlan=False, vlan=vlan)
             if filter_learned else {}
@@ -761,6 +807,9 @@ def fdb_dot1d(entry: SwitchEntry, opts: SnmpOptions,
             # Bir VLAN okunamazsa digerlerini iptal etmeyelim.
             print(f"  [!] {entry.label} vlan={vlan}: {exc}", file=sys.stderr)
             continue
+        if verbose:
+            print(f"  [{entry.label}] vlan={vlan}: {len(pairs)} FDB kaydi, "
+                  f"{len(portmap)} bridge-port")
         for oid, value in pairs:
             try:
                 _, mac = mac_from_oid_suffix(oid, with_vlan=False)
@@ -771,17 +820,20 @@ def fdb_dot1d(entry: SwitchEntry, opts: SnmpOptions,
                 continue
             if statuses and statuses.get((vlan, mac), FDB_STATUS_LEARNED) != FDB_STATUS_LEARNED:
                 continue
-            rows.append((vlan or 0, mac, bridgeport))
-    return rows
+            observations.append(
+                Observation(mac=mac, vlan=vlan or 0,
+                            port=resolve_port_name(bridgeport, portmap, ifnames))
+            )
+    return observations
 
 
 def collect_switch(entry: SwitchEntry, opts: SnmpOptions, mode: str,
                    uplink_threshold: int, filter_learned: bool,
                    verbose: bool = False) -> SwitchResult:
     """
-    Bir switch'i okur ve SwitchResult doner. DB'ye DOKUNMAZ -- bu sayede
-    birden fazla switch paralel okunabilir, DB yazimi tek thread'de kalir.
-    Hata firlatmaz; hatayi result.error icine koyar.
+    Bir switch'i SNMP ile okur ve SwitchResult doner. DB'ye DOKUNMAZ -- bu
+    sayede birden fazla switch paralel okunabilir, DB yazimi tek thread'de
+    kalir. Hata firlatmaz; hatayi result.error icine koyar.
     """
     result = SwitchResult(entry=entry)
     try:
@@ -790,34 +842,195 @@ def collect_switch(entry: SwitchEntry, opts: SnmpOptions, mode: str,
         if verbose:
             print(f"  [{entry.label}] {len(portmap)} bridge-port, {len(ifnames)} arayuz adi")
 
-        rows: list[tuple[int, str, int]] = []
+        observations: list[Observation] = []
         if mode in ("dot1q", "auto"):
-            rows = fdb_dot1q(entry, opts, filter_learned)
+            observations = fdb_dot1q(entry, opts, filter_learned, portmap, ifnames)
             result.mode_used = "dot1q"
-        if not rows and mode in ("dot1d", "auto"):
-            rows = fdb_dot1d(entry, opts, filter_learned)
+        if not observations and mode in ("dot1d", "auto"):
+            observations = fdb_dot1d(entry, opts, filter_learned, ifnames, verbose)
             result.mode_used = "dot1d"
-        if not rows and not portmap:
+        if not observations and not portmap and not ifnames:
             raise SnmpError(
-                "ne Q-BRIDGE ne BRIDGE MIB okunabildi "
+                "switch'ten hicbir tablo okunamadi "
                 "(SNMP view/community, MIB destegi ya da VLAN listesini kontrol et)"
             )
 
-        for vlan, mac, bridgeport in rows:
-            ifindex = portmap.get(bridgeport)
-            if ifindex is not None and ifindex in ifnames:
-                port = ifnames[ifindex]
-            elif ifindex is not None:
-                port = f"ifIndex{ifindex}"
-            else:
-                port = f"bridgeport{bridgeport}"
-            result.observations.append(Observation(mac=mac, vlan=vlan, port=port))
-
-        result.port_macs = count_macs_per_port(result.observations)
-        result.uplink_ports = find_uplink_ports(result.observations, uplink_threshold)
+        result.observations = observations
+        result.port_macs = count_macs_per_port(observations)
+        result.uplink_ports = find_uplink_ports(observations, uplink_threshold)
     except SnmpError as exc:
         result.error = str(exc)
     except Exception as exc:  # tek switch butun poll'u dusurmesin
+        result.error = f"{type(exc).__name__}: {exc}"
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 4b) SSH KATMANI -- Cisco IOS 'show mac address-table' (SNMP alternatifi)
+# ---------------------------------------------------------------------------
+#
+# Neden var: bazi platformlarda (ornegin EVE-NG/GNS3'teki IOL/IOU imajlari)
+# Q-BRIDGE MIB yok, Cisco'nun 'community@vlan' indexlemesi yok ve VLAN
+# context'leri de calismiyor. Bu durumda SNMP ile VLAN basina FDB okumak
+# mumkun olmuyor. 'show mac address-table' ise VLAN + MAC + port bilgisini
+# tek komutta, hicbir MIB destegine ihtiyac duymadan veriyor.
+
+# Cisco'nun uc formatini da tolere eder:
+#   IOS      :   10    aabb.cc02.1010    DYNAMIC     Et0/1
+#   IOS-XE   :   10    0050.7966.6826    DYNAMIC     Gi1/0/5
+#   NX-OS    : * 10    aabb.cc02.1010   dynamic  0    F    F  Eth1/1
+MAC_TABLE_LINE_RE = re.compile(
+    r"^\s*[*+]?\s*"
+    r"(?P<vlan>\d{1,4}|[Aa]ll|-)\s+"
+    r"(?P<mac>[0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4}"
+    r"|[0-9a-fA-F]{2}(?:[:-][0-9a-fA-F]{2}){5})\s+"
+    r"(?P<rest>\S.*)$"
+)
+
+# Cihaz gercek bir port degil, dahili bir hedef gosterdiginde
+NON_PORT_TOKENS = {"cpu", "router", "switch", "drop", "n/a", "-", "vl1"}
+
+
+@dataclass
+class SshOptions:
+    """SSH toplayicisi icin ayarlar (tum switch'ler icin gecerli varsayilanlar)."""
+    user: str = ""
+    password: str = ""
+    enable_password: str = ""
+    port: int = 22
+    timeout: int = 20
+    command: str = "show mac address-table"
+
+
+def parse_mac_address_table(text: str) -> list[Observation]:
+    """
+    'show mac address-table' ciktisini Observation listesine cevirir.
+    Sadece DYNAMIC kayitlar alinir: statik/CPU kayitlari bir cihazin
+    o portta oldugu anlamina gelmez.
+    """
+    observations: list[Observation] = []
+    for line in text.splitlines():
+        match = MAC_TABLE_LINE_RE.match(line)
+        if not match:
+            continue
+        rest = match.group("rest").split()
+        if not rest:
+            continue
+        entry_type = rest[0].lower()
+        if "dynamic" not in entry_type:
+            continue
+        port = rest[-1]
+        if port.lower() in NON_PORT_TOKENS:
+            continue
+        try:
+            mac = normalize_mac(match.group("mac"))
+        except ValueError:
+            continue
+        vlan_text = match.group("vlan")
+        vlan = int(vlan_text) if vlan_text.isdigit() else 0
+        observations.append(Observation(mac=mac, vlan=vlan, port=port))
+    return observations
+
+
+def _read_until_idle(channel, idle: float = 1.0, total: float = 20.0) -> str:
+    """Kanaldan veri akisi durana kadar oku. IOS prompt'u cesitlilik gosterdigi
+    icin prompt yakalamak yerine 'sessizlik' beklemek daha saglam."""
+    buffer = []
+    deadline = time.monotonic() + total
+    last_data = time.monotonic()
+    while time.monotonic() < deadline:
+        if channel.recv_ready():
+            chunk = channel.recv(65535).decode("utf-8", errors="replace")
+            buffer.append(chunk)
+            last_data = time.monotonic()
+        else:
+            if time.monotonic() - last_data > idle and buffer:
+                break
+            time.sleep(0.1)
+    return "".join(buffer)
+
+
+def ssh_fetch_mac_table(entry: SwitchEntry, opts: SshOptions, verbose: bool = False) -> str:
+    """
+    Switch'e SSH ile baglanip MAC adres tablosunu getirir. Ciktiyi ham metin
+    olarak doner. Basarisizlikta SnmpError firlatir (ayni hata yolu kullanilsin
+    diye; mesajda yontem belirtilir).
+    """
+    try:
+        import paramiko
+    except ImportError as exc:
+        raise SnmpError(
+            "SSH toplayicisi icin paramiko gerekli: pip3 install paramiko"
+        ) from exc
+
+    user = entry.ssh_user or opts.user
+    password = entry.ssh_pass or opts.password
+    if not user:
+        raise SnmpError("SSH icin kullanici adi yok (--ssh-user ya da envanterde ssh_user)")
+
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        client.connect(
+            hostname=entry.switch, port=opts.port, username=user, password=password,
+            look_for_keys=False, allow_agent=False, timeout=opts.timeout,
+        )
+        channel = client.invoke_shell(width=200, height=1000)
+        banner = _read_until_idle(channel, idle=0.8, total=opts.timeout)
+
+        # Kullanici modundaysak enable'a gec
+        if banner.rstrip().endswith(">") and opts.enable_password:
+            channel.send("enable\n")
+            _read_until_idle(channel, idle=0.5, total=opts.timeout)
+            channel.send(opts.enable_password + "\n")
+            _read_until_idle(channel, idle=0.8, total=opts.timeout)
+
+        channel.send("terminal length 0\n")
+        _read_until_idle(channel, idle=0.5, total=opts.timeout)
+
+        channel.send(opts.command + "\n")
+        output = _read_until_idle(channel, idle=1.2, total=opts.timeout * 3)
+
+        # Eski IOS'larda komut 'show mac-address-table' (tireli) olabiliyor
+        if "Invalid input" in output or "% Ambiguous" in output:
+            alternate = ("show mac-address-table"
+                         if "-" not in opts.command else "show mac address-table")
+            if verbose:
+                print(f"  [{entry.label}] komut kabul edilmedi, deneniyor: {alternate}")
+            channel.send(alternate + "\n")
+            output = _read_until_idle(channel, idle=1.2, total=opts.timeout * 3)
+
+        channel.close()
+        return output
+    except SnmpError:
+        raise
+    except Exception as exc:
+        raise SnmpError(f"SSH hatasi: {type(exc).__name__}: {exc}") from exc
+    finally:
+        client.close()
+
+
+def collect_switch_ssh(entry: SwitchEntry, opts: SshOptions, uplink_threshold: int,
+                       verbose: bool = False) -> SwitchResult:
+    """SSH ile MAC tablosunu okur. collect_switch ile ayni SwitchResult'i doner."""
+    result = SwitchResult(entry=entry)
+    result.mode_used = "ssh"
+    try:
+        text = ssh_fetch_mac_table(entry, opts, verbose)
+        observations = parse_mac_address_table(text)
+        if entry.vlans:
+            observations = [o for o in observations if o.vlan in entry.vlans]
+        if not observations:
+            snippet = " | ".join(line.strip() for line in text.splitlines()[-5:] if line.strip())
+            raise SnmpError(f"MAC tablosu bos ya da anlasilamadi. Son satirlar: {snippet[:300]}")
+        if verbose:
+            print(f"  [{entry.label}] SSH: {len(observations)} dinamik kayit")
+        result.observations = observations
+        result.port_macs = count_macs_per_port(observations)
+        result.uplink_ports = find_uplink_ports(observations, uplink_threshold)
+    except SnmpError as exc:
+        result.error = str(exc)
+    except Exception as exc:
         result.error = f"{type(exc).__name__}: {exc}"
     return result
 
@@ -828,13 +1041,16 @@ def collect_switch(entry: SwitchEntry, opts: SnmpOptions, mode: str,
 
 def poll_once(conn: sqlite3.Connection, entries: list[SwitchEntry], opts: SnmpOptions,
               mode: str, uplink_threshold: int, keep_uplinks: bool,
-              filter_learned: bool, workers: int, verbose: bool = False) -> dict:
+              filter_learned: bool, workers: int, verbose: bool = False,
+              collector: str = "snmp", ssh_opts: SshOptions | None = None) -> dict:
     """Tum switch'leri (paralel) okur, sonuclari DB'ye yazar, ozet doner."""
     started = now_utc()
     stats = {"switches": len(entries), "ok": 0, "failed": 0,
              "observed": 0, "recorded": 0, "uplink_skipped": 0}
 
     def work(entry: SwitchEntry) -> SwitchResult:
+        if collector == "ssh":
+            return collect_switch_ssh(entry, ssh_opts or SshOptions(), uplink_threshold, verbose)
         return collect_switch(entry, opts, mode, uplink_threshold, filter_learned, verbose)
 
     if workers > 1 and len(entries) > 1:
@@ -1047,7 +1263,7 @@ def cmd_prune(conn: sqlite3.Connection, days: int) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Cihazlarin hangi switch portunda oldugunu SNMP ile takip eder.",
+        description="Cihazlarin hangi switch portunda oldugunu takip eder (SNMP ya da SSH).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Ornek: mac_tracker.py --once -v   |   mac_tracker.py --lookup aabb.ccdd.eeff",
     )
@@ -1068,8 +1284,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--switch", metavar="SWITCH", help="--port ile birlikte switch filtresi")
     parser.add_argument("--interval", type=int, default=60, help="--loop poll araligi (saniye)")
+    parser.add_argument("--collector", choices=["snmp", "ssh"], default="snmp",
+                        help="Veri kaynagi: snmp (varsayilan) ya da ssh ('show mac address-table')")
     parser.add_argument("--mode", choices=["auto", "dot1q", "dot1d"], default="auto",
-                        help="FDB okuma yontemi (varsayilan auto: once dot1q, sonra dot1d)")
+                        help="SNMP'de FDB okuma yontemi (varsayilan auto: once dot1q, sonra dot1d)")
     parser.add_argument("--uplink-threshold", type=int, default=10,
                         help="Bir portta bundan fazla MAC varsa uplink/trunk say (0 = kapali)")
     parser.add_argument("--keep-uplinks", action="store_true",
@@ -1095,7 +1313,29 @@ def build_parser() -> argparse.ArgumentParser:
     snmp.add_argument("--v3-priv-proto", default="AES")
     snmp.add_argument("--v3-priv-pass", default=os.environ.get("SNMP_V3_PRIV_PASS", ""),
                       help="Komut satiri yerine SNMP_V3_PRIV_PASS ortam degiskenini kullan")
+
+    ssh = parser.add_argument_group("SSH ayarlari (--collector ssh)")
+    ssh.add_argument("--ssh-user", default=os.environ.get("MACTRACK_SSH_USER", ""))
+    ssh.add_argument("--ssh-pass", default=os.environ.get("MACTRACK_SSH_PASS", ""),
+                     help="Komut satiri yerine MACTRACK_SSH_PASS ortam degiskenini kullan")
+    ssh.add_argument("--ssh-enable-pass", default=os.environ.get("MACTRACK_SSH_ENABLE", ""),
+                     help="Gerekiyorsa enable parolasi (MACTRACK_SSH_ENABLE)")
+    ssh.add_argument("--ssh-port", type=int, default=22)
+    ssh.add_argument("--ssh-timeout", type=int, default=20)
+    ssh.add_argument("--ssh-command", default="show mac address-table",
+                     help="Calistirilacak komut (eski IOS: 'show mac-address-table')")
     return parser
+
+
+def ssh_options_from_args(args) -> SshOptions:
+    return SshOptions(
+        user=args.ssh_user,
+        password=args.ssh_pass,
+        enable_password=args.ssh_enable_pass,
+        port=args.ssh_port,
+        timeout=args.ssh_timeout,
+        command=args.ssh_command,
+    )
 
 
 def snmp_options_from_args(args) -> SnmpOptions:
@@ -1130,15 +1370,21 @@ def load_inventory_or_exit(path: str) -> list[SwitchEntry]:
 def run_poll_session(args, loop: bool) -> None:
     entries = load_inventory_or_exit(args.inventory)
     opts = snmp_options_from_args(args)
-    opts.walk_binary = pick_walk_binary()
+    ssh_opts = ssh_options_from_args(args)
+    if args.collector == "snmp":
+        opts.walk_binary = pick_walk_binary()
+        how = f"snmp/{args.mode} ({opts.walk_binary})"
+    else:
+        how = f"ssh ({ssh_opts.command})"
     conn = init_db(args.db)
-    print(f"{len(entries)} switch, yontem={args.mode}, walk={opts.walk_binary}, db={args.db}")
+    print(f"{len(entries)} switch, yontem={how}, db={args.db}")
     try:
         while True:
             start = time.monotonic()
             stats = poll_once(
                 conn, entries, opts, args.mode, args.uplink_threshold,
                 args.keep_uplinks, not args.no_status_filter, args.workers, args.verbose,
+                collector=args.collector, ssh_opts=ssh_opts,
             )
             print(
                 f"Poll bitti: {stats['ok']}/{stats['switches']} switch ok, "

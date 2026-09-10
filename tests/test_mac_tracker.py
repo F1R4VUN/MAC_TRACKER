@@ -400,6 +400,162 @@ class TestAuthArgs(unittest.TestCase):
         with self.assertRaises(mt.SnmpError):
             mt.build_auth_args(entry, mt.SnmpOptions())
 
+# Asagidaki ciktilar EVE-NG'deki gercek bir IOL switch'inden alindi.
+IOS_MAC_TABLE = """SW1#show mac address-table
+          Mac Address Table
+-------------------------------------------
+
+Vlan    Mac Address       Type        Ports
+----    -----------       --------    -----
+  10    aabb.cc02.1010    DYNAMIC     Et0/1
+  10    0050.7966.6826    DYNAMIC     Et0/0
+  99    000c.2987.72dc    DYNAMIC     Et0/3
+  99    0045.e284.4021    DYNAMIC     Et0/3
+  99    5c7d.aef0.323c    DYNAMIC     Et0/3
+Total Mac Addresses for this criterion: 5
+SW1#"""
+
+IOSXE_MAC_TABLE = """          Mac Address Table
+-------------------------------------------
+
+Vlan    Mac Address       Type        Ports
+----    -----------       --------    -----
+ All    0100.0ccc.cccc    STATIC      CPU
+ All    0180.c200.0000    STATIC      CPU
+  10    0050.7966.6826    DYNAMIC     Gi1/0/5
+  10    0100.5e00.0128    STATIC      Gi1/0/1 Gi1/0/2
+  20    a0b1.c2d3.e4f5    DYNAMIC     Po1
+Total Mac Addresses for this criterion: 5"""
+
+NXOS_MAC_TABLE = """Legend:
+        * - primary entry, G - Gateway MAC, (R) - Routed MAC, O - Overlay MAC
+   VLAN     MAC Address      Type      age     Secure NTFY Ports
+---------+-----------------+--------+---------+------+----+------------------
+* 10       aabb.cc02.1010   dynamic  0         F      F    Eth1/1
+* 20       0050.7966.6826   dynamic  0         F      F    Po10
+G  -       5c7d.aef0.323c   static   -         F      F    sup-eth1(R)"""
+
+
+class TestMacAddressTableParsing(unittest.TestCase):
+    """SSH toplayicisinin 'show mac address-table' parse'i (gercek cihaz ciktilari)."""
+
+    def test_ios_iol_output(self):
+        observations = mt.parse_mac_address_table(IOS_MAC_TABLE)
+        self.assertEqual(len(observations), 5)
+        by_mac = {o.mac: o for o in observations}
+        pc = by_mac["00:50:79:66:68:26"]
+        self.assertEqual((pc.vlan, pc.port), (10, "Et0/0"))
+        neighbor = by_mac["AA:BB:CC:02:10:10"]
+        self.assertEqual((neighbor.vlan, neighbor.port), (10, "Et0/1"))
+
+    def test_header_and_footer_lines_ignored(self):
+        for line in ("Total Mac Addresses for this criterion: 5",
+                     "Vlan    Mac Address       Type        Ports",
+                     "----    -----------       --------    -----",
+                     "          Mac Address Table"):
+            self.assertEqual(mt.parse_mac_address_table(line), [])
+
+    def test_static_and_cpu_entries_skipped(self):
+        observations = mt.parse_mac_address_table(IOSXE_MAC_TABLE)
+        self.assertEqual({o.mac for o in observations},
+                         {"00:50:79:66:68:26", "A0:B1:C2:D3:E4:F5"})
+        by_mac = {o.mac: o for o in observations}
+        self.assertEqual(by_mac["00:50:79:66:68:26"].port, "Gi1/0/5")
+        self.assertEqual(by_mac["A0:B1:C2:D3:E4:F5"].port, "Po1")   # port-channel de gecerli
+
+    def test_nxos_output(self):
+        observations = mt.parse_mac_address_table(NXOS_MAC_TABLE)
+        self.assertEqual(len(observations), 2)                       # static sup-eth1 atlanir
+        by_mac = {o.mac: o for o in observations}
+        self.assertEqual((by_mac["AA:BB:CC:02:10:10"].vlan,
+                          by_mac["AA:BB:CC:02:10:10"].port), (10, "Eth1/1"))
+        self.assertEqual(by_mac["00:50:79:66:68:26"].port, "Po10")
+
+    def test_garbage_input_is_safe(self):
+        self.assertEqual(mt.parse_mac_address_table(""), [])
+        self.assertEqual(mt.parse_mac_address_table("% Invalid input detected at '^' marker."), [])
+        self.assertEqual(mt.parse_mac_address_table("Translating \"foo\"...domain server"), [])
+
+    def test_uplink_filter_applies_to_ssh_data(self):
+        """IOL ciktisinda Et0/3 uc MAC tasiyor -- esik 2 olursa uplink sayilmali."""
+        observations = mt.parse_mac_address_table(IOS_MAC_TABLE)
+        self.assertEqual(mt.find_uplink_ports(observations, 2), {"Et0/3"})
+
+
+class TestSshCollectorWithFakeTransport(unittest.TestCase):
+    """collect_switch_ssh -- gercek SSH baglantisi olmadan."""
+
+    def setUp(self):
+        self.real_fetch = mt.ssh_fetch_mac_table
+        self.addCleanup(setattr, mt, "ssh_fetch_mac_table", self.real_fetch)
+        self.entry = mt.SwitchEntry(switch="192.168.122.10", label="SW1")
+        self.opts = mt.SshOptions(user="admin", password="x")
+
+    def test_collect(self):
+        mt.ssh_fetch_mac_table = lambda entry, opts, verbose=False: IOS_MAC_TABLE
+        result = mt.collect_switch_ssh(self.entry, self.opts, uplink_threshold=10)
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(result.mode_used, "ssh")
+        self.assertEqual(len(result.observations), 5)
+        self.assertEqual(result.port_macs["Et0/3"], 3)
+
+    def test_vlan_filter(self):
+        mt.ssh_fetch_mac_table = lambda entry, opts, verbose=False: IOS_MAC_TABLE
+        self.entry.vlans = [10]
+        result = mt.collect_switch_ssh(self.entry, self.opts, uplink_threshold=10)
+        self.assertEqual({o.vlan for o in result.observations}, {10})
+
+    def test_ssh_failure_reported_not_raised(self):
+        def boom(entry, opts, verbose=False):
+            raise mt.SnmpError("SSH hatasi: AuthenticationException")
+        mt.ssh_fetch_mac_table = boom
+        result = mt.collect_switch_ssh(self.entry, self.opts, uplink_threshold=10)
+        self.assertFalse(result.ok)
+        self.assertIn("AuthenticationException", result.error)
+
+    def test_empty_table_is_an_error_not_silent_success(self):
+        mt.ssh_fetch_mac_table = lambda entry, opts, verbose=False: "SW1#\nSW1#"
+        result = mt.collect_switch_ssh(self.entry, self.opts, uplink_threshold=10)
+        self.assertFalse(result.ok)
+
+
+class TestDot1dPerVlanPortMap(unittest.TestCase):
+    """
+    Gercek IOL bulgusu: dot1dBasePortIfIndex tablosu da VLAN context'ine bagli.
+    Harita her VLAN icin ayri okunmazsa port adi 'bridgeport<N>' olarak kalir.
+    """
+
+    def setUp(self):
+        self.real_walk = mt.snmp_walk
+        self.addCleanup(setattr, mt, "snmp_walk", self.real_walk)
+        self.entry = mt.SwitchEntry(switch="10.1.1.1", community="public",
+                                    label="SW1", vlans=[10])
+        self.opts = mt.SnmpOptions(walk_binary="snmpwalk")
+
+    def test_portmap_read_within_vlan_context(self):
+        def fake_walk(entry, opts, oid, vlan=None):
+            if oid == mt.OID_DOT1D_BASEPORT_IFINDEX:
+                if vlan == 10:                       # VLAN 10 context'i
+                    return [(f"{mt.OID_DOT1D_BASEPORT_IFINDEX}.1", "1")]
+                return [(f"{mt.OID_DOT1D_BASEPORT_IFINDEX}.3", "3")]   # VLAN 1 context'i
+            if oid == mt.OID_IFNAME:
+                return [(f"{mt.OID_IFNAME}.1", "Et0/0"), (f"{mt.OID_IFNAME}.3", "Et0/2")]
+            if oid == mt.OID_DOT1Q_FDB_PORT:
+                return []                            # IOL'de Q-BRIDGE yok
+            if oid == mt.OID_DOT1D_FDB_PORT and vlan == 10:
+                return [(f"{mt.OID_DOT1D_FDB_PORT}.0.80.121.102.104.38", "1")]
+            return []
+        mt.snmp_walk = fake_walk
+
+        result = mt.collect_switch(self.entry, self.opts, "auto", 10, False)
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(result.mode_used, "dot1d")
+        self.assertEqual(len(result.observations), 1)
+        obs = result.observations[0]
+        self.assertEqual(obs.mac, "00:50:79:66:68:26")
+        self.assertEqual(obs.vlan, 10)
+        self.assertEqual(obs.port, "Et0/0")          # 'bridgeport1' OLMAMALI
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

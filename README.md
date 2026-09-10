@@ -120,12 +120,45 @@ Portta MAC   : 1
 
 ## Onemli detaylar
 
-**MAC tablosu okuma yontemi (`--mode`)**
+**Veri kaynagi (`--collector`)**
+
+| Kaynak | Anlami |
+|---|---|
+| `snmp` | **Varsayilan.** FDB'yi SNMP ile okur (asagidaki `--mode`). |
+| `ssh` | Cihaza SSH ile baglanip `show mac address-table` ciktisini parse eder. VLAN + MAC + port tek komutta gelir, MIB destegine ihtiyac yoktur. `pip3 install paramiko` gerekir. |
+
+SSH yolu ne zaman gerekir: bazi platformlarda -- ozellikle EVE-NG/GNS3'teki
+**IOL/IOU imajlari** -- Q-BRIDGE MIB yoktur, Cisco'nun `community@vlan`
+indexlemesi calismaz ve VLAN context'leri de yoktur. Bu durumda SNMP ile
+VLAN basina FDB okumak mumkun olmaz; `--collector ssh` calisan tek yoldur.
+Gercek Catalyst/Nexus'ta SNMP yolu tercih edilir (daha hafif, kimlik
+bilgisi yonetimi daha basit).
+
+```bash
+# Switch'te SSH acik olmali:
+#   ip domain-name lab.local
+#   crypto key generate rsa modulus 1024
+#   username admin privilege 15 secret <parola>
+#   line vty 0 4 / login local / transport input ssh
+
+export MACTRACK_SSH_PASS='...'
+export MACTRACK_SSH_ENABLE='...'          # gerekiyorsa enable parolasi
+python3 mac_tracker.py --once -v --collector ssh --ssh-user admin
+
+# Eski IOS'larda komut tireli:
+python3 mac_tracker.py --once --collector ssh --ssh-user admin --ssh-command "show mac-address-table"
+```
+
+Parse edici IOS, IOS-XE ve NX-OS ciktilarini tanir; yalnizca `DYNAMIC`
+kayitlari alir (`STATIC`/`CPU`/`sup-eth1` gibi satirlar bir cihazin o portta
+oldugu anlamina gelmez).
+
+**MAC tablosu okuma yontemi (`--mode`, sadece `--collector snmp`)**
 
 | Mod | Anlami |
 |---|---|
 | `dot1q` | Standart Q-BRIDGE MIB (`dot1qTpFdbPort`). VLAN, OID index'inde geldigi icin **tek walk tum VLAN'lari** verir. Marka bagimsiz ve hizli. |
-| `dot1d` | Klasik BRIDGE MIB. VLAN tasimadigi icin VLAN basina ayri sorgu: Cisco'da v2c `community@vlan`, v3'te `vlan-<id>` context. Eski Catalyst'ler icin. Envanterde `vlans` sart. |
+| `dot1d` | Klasik BRIDGE MIB. VLAN tasimadigi icin VLAN basina ayri sorgu: Cisco'da v2c `community@vlan`, v3'te `vlan-<id>` context. Eski Catalyst'ler icin. Envanterde `vlans` sart. Bridge-port -> ifIndex haritasi da VLAN context'ine bagli oldugu icin her VLAN'da ayri okunur. |
 | `auto` | **Varsayilan.** Once `dot1q`, bos donerse `dot1d`. |
 
 **Uplink/trunk portlari.** Bir cihazin MAC'i kendi access portunda gorundugu
