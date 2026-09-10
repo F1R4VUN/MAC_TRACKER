@@ -237,7 +237,7 @@ NX-OS).
 | Ortam | Yol | Sonuc |
 |---|---|---|
 | Cisco IOL (L2), EVE-NG -- tek switch | `--collector ssh` | Calisiyor -- toplama, AKTIF/KOPMUS durumu, UPSERT davranisi ucdan uca dogrulandi |
-| Cisco IOL (L2), EVE-NG -- 5 switch (2 dist + 3 access, cift baglantili, STP'li) | `--collector ssh` | Calisiyor -- paralel toplama, uplink/trunk eleme, access portunun trunk'i yenmesi dogrulandi |
+| Cisco IOL (L2), EVE-NG -- 5 switch (2 dist + 3 access, cift baglantili, STP'li) | `--collector ssh` | Calisiyor -- paralel toplama, uplink/trunk eleme, access portunun trunk'i yenmesi, cihazi baska switch'e tasiyinca **tek** hareket kaydi uretilmesi dogrulandi |
 | Cisco IOL (L2), EVE-NG | `--collector snmp` | **Calismiyor** -- imajda Q-BRIDGE MIB yok, `community@vlan` indexlemesi yok, VLAN context'i yok |
 
 IOL'de SNMP ile ogrenilenler (gercek Catalyst'te bunlarin cogu gecerli degildir,
@@ -252,6 +252,24 @@ ama benzer kisitli platformlarda ise yarar):
   yalnizca VLAN 1'in portlarini verir ve bridge-port numaralari VLAN'dan
   VLAN'a degisebilir. Bu yuzden dot1d modunda harita, FDB ile ayni VLAN
   context'i icinde okunur (aksi halde port adi `bridgeport<N>` olarak kalirdi).
+
+5 switch'lik lab'da bir PC `ACCESS_1 Et0/0`'dan `ACCESS_2 Et0/3`'e tasindiginda
+uretilen `--history` ciktisi, aracin varlik sebebini ozetliyor:
+
+```
+SWITCH      PORT     VLAN  ILK GORULME                SON GORULME                POLL
+ACCESS_2    Et0/3      10  2026-09-11 02:34:03 +0300  2026-09-11 02:34:03 +0300     1
+ACCESS_1    Et0/0      10  2026-09-11 02:21:19 +0300  2026-09-11 02:24:37 +0300     2
+DIST_SW1    Et0/1      10  2026-09-11 02:24:37 +0300  2026-09-11 02:24:37 +0300     1
+
+Port degisiklikleri (1):
+  2026-09-11 02:34:03 +0300  ACCESS_1 Et0/0  ->  ACCESS_2 Et0/3
+```
+
+Ikinci satirdaki `SON GORULME`, cihazin eski portunda **en son ne zaman aktif
+oldugu**dur. Ucuncu satir DIST_SW1'in trunk'inda birakilan izdir; bu testte
+`--uplink-threshold 2` gibi agresif bir esik kullanildigi ve o an trunk'ta az
+MAC oldugu icin elenmemistir -- gercek agda varsayilan 10 bunu temizler.
 
 **Aging suresi.** Bir MAC, cihaz susunca aging-time (Cisco varsayilani 300 sn)
 sonunda FDB'den dusar. Lab'da poll'lar arasinda cihaz sessiz kalirsa "kayit yok"
