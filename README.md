@@ -253,6 +253,47 @@ ama benzer kisitli platformlarda ise yarar):
   VLAN'a degisebilir. Bu yuzden dot1d modunda harita, FDB ile ayni VLAN
   context'i icinde okunur (aksi halde port adi `bridgeport<N>` olarak kalirdi).
 
+### Test topolojisi
+
+Iki dagitim + uc erisim switch'i, her erisim switch'i iki dagitim switch'ine de
+bagli (yani kapali dongu var, STP bir tarafi blokluyor). Yonetim VLAN 99
+uzerinden, DIST_SW1'in `e0/3` portundaki bulut ile toplayici makineye cikiyor.
+
+**Baslangic durumu** -- PC1, ACCESS_1 `Et0/0`'da:
+
+```mermaid
+graph TD
+    NET(("Net<br/>Cloud0 / pnet0")) ---|e0/3| D1["DIST_SW1<br/>192.168.1.201<br/><i>STP root</i>"]
+    D1 ---|e0/1 - e0/1| A1["ACCESS_1<br/>192.168.1.211"]
+    D1 ---|e0/2 - e0/2| A2["ACCESS_2<br/>192.168.1.212"]
+    D1 ---|e0/0 - e0/0| A3["ACCESS_3<br/>192.168.1.213"]
+    A1 ---|e0/2 - e0/2| D2["DIST_SW2<br/>192.168.1.202"]
+    A2 ---|e0/0 - e0/0| D2
+    A3 ---|e0/3 - e0/3| D2
+    A1 ===|e0/0| PC1["PC1<br/>vlan 10<br/>0050.7966.6830"]
+    A1 ---|e0/3| PC2["PC2<br/>vlan 20"]
+    A3 ---|e0/1| PC3["PC3<br/>vlan 10"]
+    A3 ---|e0/2| PC4["PC4<br/>vlan 20"]
+```
+
+**Tasima sonrasi** -- PC1 ayni VLAN'da kalarak ACCESS_2 `Et0/3`'e alindi:
+
+```mermaid
+graph TD
+    NET(("Net<br/>Cloud0 / pnet0")) ---|e0/3| D1["DIST_SW1<br/>192.168.1.201<br/><i>STP root</i>"]
+    D1 ---|e0/1 - e0/1| A1["ACCESS_1<br/>192.168.1.211"]
+    D1 ---|e0/2 - e0/2| A2["ACCESS_2<br/>192.168.1.212"]
+    D1 ---|e0/0 - e0/0| A3["ACCESS_3<br/>192.168.1.213"]
+    A1 ---|e0/2 - e0/2| D2["DIST_SW2<br/>192.168.1.202"]
+    A2 ---|e0/0 - e0/0| D2
+    A3 ---|e0/3 - e0/3| D2
+    A1 -.-|"e0/0 (bos)"| X(("PC1 buradan<br/>alindi"))
+    A2 ===|e0/3| PC1["PC1<br/>vlan 10<br/>0050.7966.6830"]
+    A1 ---|e0/3| PC2["PC2<br/>vlan 20"]
+    A3 ---|e0/1| PC3["PC3<br/>vlan 10"]
+    A3 ---|e0/2| PC4["PC4<br/>vlan 20"]
+```
+
 5 switch'lik lab'da bir PC `ACCESS_1 Et0/0`'dan `ACCESS_2 Et0/3`'e tasindiginda
 uretilen `--history` ciktisi, aracin varlik sebebini ozetliyor:
 
