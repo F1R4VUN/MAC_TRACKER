@@ -28,21 +28,42 @@ switch (SNMP) --> mac_tracker.py --> mac_tracker.db (SQLite dosyasi)
 ## Kurulum
 
 ```bash
-# 1) net-snmp araclari (snmpbulkwalk varsa otomatik olarak o kullanilir)
+# 1) SNMP yolu icin net-snmp (snmpbulkwalk varsa otomatik secilir)
 sudo apt install snmp                 # Linux
 # Windows: https://www.net-snmp.org/  ya da  choco install net-snmp
+
+# 1b) SSH yolu icin (--collector ssh)
+pip3 install paramiko                 # ya da: apt install python3-paramiko
 
 # 2) Envanter
 cp inventory.csv.example inventory.csv
 $EDITOR inventory.csv
 
-# 3) Test (ag gerektirmez, 42 test)
+# 3) Test (ag gerektirmez, 53 test)
 python3 mac_tracker.py --selftest
 ```
 
-Python 3.9+ yeterli, **harici pip paketi yok**. SQLite ayri bir servis degil,
-sadece bir dosya: `--db` ile verdigin dosya yoksa tablolariyla birlikte
-otomatik olusturulur.
+**Surum sartlari**
+
+| Bilesen | Gereken | Neden |
+|---|---|---|
+| Python | **3.7+** (3.8+ onerilir) | dataclasses, `subprocess.run(capture_output=)`, `datetime.fromisoformat` |
+| SQLite | **3.24+** | UPSERT (`ON CONFLICT ... DO UPDATE`) -- Python'un kendi `sqlite3` modulunden gelir |
+| paramiko | sadece `--collector ssh` icin | SNMP yolu harici paket istemez |
+
+Surumleri kontrol et:
+
+```bash
+python3 --version
+python3 -c "import sqlite3; print(sqlite3.sqlite_version)"
+```
+
+> Dikkat: Ubuntu 16.04 tabanli sistemler (ornegin bazi EVE-NG surumleri)
+> Python 3.5 ve SQLite 3.11 ile gelir; script orada **calismaz**. Toplayiciyi
+> baska bir makinede calistir -- switch'e IP erisimi olmasi yeterli.
+
+SQLite ayri bir servis degil, sadece bir dosya: `--db` ile verdigin dosya
+yoksa tablolariyla birlikte otomatik olusturulur.
 
 Switch tarafinda gereken tek sey read-only SNMP erisimi:
 
@@ -151,7 +172,8 @@ python3 mac_tracker.py --once --collector ssh --ssh-user admin --ssh-command "sh
 
 Parse edici IOS, IOS-XE ve NX-OS ciktilarini tanir; yalnizca `DYNAMIC`
 kayitlari alir (`STATIC`/`CPU`/`sup-eth1` gibi satirlar bir cihazin o portta
-oldugu anlamina gelmez).
+oldugu anlamina gelmez). Bu yol EVE-NG'deki gercek bir Cisco IOL switch'inde
+ucdan uca dogrulandi -- ayrintilar icin **Dogrulanmis ortamlar** bolumu.
 
 **MAC tablosu okuma yontemi (`--mode`, sadece `--collector snmp`)**
 
@@ -204,8 +226,45 @@ python3 mac_tracker.py --selftest              # ya da
 python3 -m unittest discover -s tests -t . -v
 ```
 
-Testler gercek switch gerektirmez; SNMP katmani sahte `snmp_walk` ile,
-veritabani katmani `:memory:` DB ile test edilir.
+53 test; hicbiri gercek switch gerektirmez. SNMP katmani sahte `snmp_walk`
+ile, SSH katmani sahte `ssh_fetch_mac_table` ile, veritabani katmani
+`:memory:` DB ile test edilir. `show mac address-table` parse testleri
+gercek cihaz ciktilarindan alinmis fixture'lar kullanir (IOS/IOL, IOS-XE,
+NX-OS).
+
+## Dogrulanmis ortamlar
+
+| Ortam | Yol | Sonuc |
+|---|---|---|
+| Cisco IOL (L2), EVE-NG | `--collector ssh` | Calisiyor -- toplama, AKTIF/KOPMUS durumu, UPSERT davranisi ucdan uca dogrulandi |
+| Cisco IOL (L2), EVE-NG | `--collector snmp` | **Calismiyor** -- imajda Q-BRIDGE MIB yok, `community@vlan` indexlemesi yok, VLAN context'i yok |
+
+IOL'de SNMP ile ogrenilenler (gercek Catalyst'te bunlarin cogu gecerli degildir,
+ama benzer kisitli platformlarda ise yarar):
+
+* `dot1qTpFdbPort` (Q-BRIDGE) → `No Such Instance`, tablo hic yok.
+* `public@10` gibi VLAN indexli community → **timeout**; agent bu sozdizimini
+  tanimadigi icin istegi sessizce dusuruyor. `public@1` bile cevapsiz.
+* Varsayilan community VLAN 1 context'ine denk geliyor. VLAN 1 bos oldugunda
+  `dot1dTpFdbPort` de `No Such Instance` doner -- bu "MIB yok" demek degildir.
+* `dot1dBasePortIfIndex` **de VLAN context'ine baglidir**: varsayilan community
+  yalnizca VLAN 1'in portlarini verir ve bridge-port numaralari VLAN'dan
+  VLAN'a degisebilir. Bu yuzden dot1d modunda harita, FDB ile ayni VLAN
+  context'i icinde okunur (aksi halde port adi `bridgeport<N>` olarak kalirdi).
+
+## Sorun giderme
+
+| Belirti | Sebep / cozum |
+|---|---|
+| `% Invalid input detected` (switch'te) | `snmpwalk` bir IOS komutu degil. SNMP/SSH komutlari **toplayici makinede** calisir, switch'te sadece `snmp-server community` / SSH yapilandirilir. |
+| `snmpwalk: invalid option -- '0'` | `-Onq` icindeki ilk karakter buyuk **O** harfidir, sifir degil. |
+| snmpwalk kendi yardim metnini basiyor | Argumanlardan biri bos; genelde `$SW` degiskeni o oturumda tanimli degil (`echo $SW` ile bak) ya da IP ile OID arasinda bosluk yok. |
+| `Timeout: No Response` | IP erisimi, community/ACL ya da (VLAN indexli sorgularda) agent'in `@vlan` sozdizimini hic tanimamasi. |
+| `Unknown user name` (v3) | Cihaz cevap veriyor ama kullanici tanimli degil. `show snmp user` ile bak -- `snmp-server user` satiri `show run`'da **gorunmez**. |
+| Ping calismiyor ama az once eklenen IP'ye ping calisiyor | Kendi makinene atadigin IP'ye ping paketi kutudan cikmaz (~0.02 ms). Gercek testte sure ms mertebesinde ve TTL cihaza gore olur. |
+| `Envanter okunamadi: ... switch satiri bulunamadi` | CSV tek satira yapismis. PowerShell'de satir sonu icin backtick (`` `n ``) gerekir; en saglami: `Set-Content -Encoding ascii inventory.csv @("switch,community,vlans,label","10.1.1.1,,,SW1")` |
+| `MAC tablosu bos ya da anlasilamadi` (ssh) | Komut kabul edilmemis olabilir: `--ssh-command "show mac-address-table"` (tireli) dene. Router'da MAC tablosu yoktur, envantere sadece switch/L3 switch koy. |
+| Cihaz switch'te gorunuyor ama `--lookup` bulmuyor | DB ancak yeni bir poll'da guncellenir; once `--once` calistir. |
 
 ## Tum secenekler
 
