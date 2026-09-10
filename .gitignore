@@ -1,0 +1,12 @@
+# SQLite veritabani (ve WAL dosyalari) -- repoya girmemeli
+*.db
+*.db-wal
+*.db-shm
+
+# Gercek envanter SNMP community stringi icerir -- ornegi commit et, gercegini etme
+inventory.csv
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
