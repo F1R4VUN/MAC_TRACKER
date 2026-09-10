@@ -557,5 +557,60 @@ class TestDot1dPerVlanPortMap(unittest.TestCase):
         self.assertEqual(obs.port, "Et0/0")          # 'bridgeport1' OLMAMALI
 
 
+class TestMultiSwitchPoll(DbTestCase):
+    """
+    Gercek lab bulgusu: ayni MAC bir poll'da hem kendi access portunda hem de
+    aradaki switch'lerin trunk portlarinda gorunur. Hareket tespiti gozlem
+    bazinda yapilirsa cihaz hic tasinmasa bile her poll'da sahte 'port
+    degisikligi' uretilir.
+    """
+
+    def _poll(self, ts, pc_switch="ACCESS_3", pc_port="Et0/2"):
+        mac = "00:50:79:66:68:33"
+        access = self._result(pc_switch, [mt.Observation(mac, 20, pc_port)], ip="192.168.1.213")
+        trunk_obs = [mt.Observation(mac, 20, "Et0/0")] + [
+            mt.Observation(f"00:11:22:33:{i:02X}:01", 99, "Et0/0") for i in range(2)]
+        trunk = self._result("DIST_SW1", trunk_obs, uplink_threshold=10, ip="192.168.1.201")
+        return mt.apply_poll_results(self.conn, [access, trunk], ts, keep_uplinks=False)
+
+    def test_same_mac_on_access_and_trunk_is_not_a_move(self):
+        self._poll("2026-09-11T02:13:00Z")
+        self._poll("2026-09-11T02:13:44Z")
+        self._poll("2026-09-11T02:14:30Z")
+        moves = self.conn.execute("SELECT COUNT(*) AS n FROM mac_moves").fetchone()["n"]
+        self.assertEqual(moves, 0)
+
+    def test_access_port_is_the_reported_location(self):
+        self._poll("2026-09-11T02:13:00Z")
+        loc = mt.current_location(self.conn, "00:50:79:66:68:33")
+        self.assertEqual((loc["switch"], loc["port"]), ("ACCESS_3", "Et0/2"))
+
+    def test_trunk_sighting_is_still_recorded_as_evidence(self):
+        self._poll("2026-09-11T02:13:00Z")
+        rows = self.conn.execute(
+            "SELECT switch, port FROM mac_locations WHERE mac = ? ORDER BY switch",
+            ("00:50:79:66:68:33",)).fetchall()
+        self.assertEqual([(r["switch"], r["port"]) for r in rows],
+                         [("ACCESS_3", "Et0/2"), ("DIST_SW1", "Et0/0")])
+
+    def test_real_move_between_switches_is_recorded_once(self):
+        self._poll("2026-09-11T02:13:00Z")
+        self._poll("2026-09-11T02:20:00Z", pc_switch="ACCESS_2", pc_port="Et0/3")
+        self._poll("2026-09-11T02:21:00Z", pc_switch="ACCESS_2", pc_port="Et0/3")
+        moves = self.conn.execute("SELECT * FROM mac_moves").fetchall()
+        self.assertEqual(len(moves), 1)
+        self.assertEqual((moves[0]["from_switch"], moves[0]["from_port"]), ("ACCESS_3", "Et0/2"))
+        self.assertEqual((moves[0]["to_switch"], moves[0]["to_port"]), ("ACCESS_2", "Et0/3"))
+
+    def test_failed_switch_does_not_block_the_others(self):
+        good = self._result("ACCESS_1", [mt.Observation("00:50:79:66:68:30", 10, "Et0/0")])
+        bad = self._result("ACCESS_2", [])
+        bad.error = "SSH hatasi: timeout"
+        stats = mt.apply_poll_results(self.conn, [good, bad], "2026-09-11T02:13:00Z", False)
+        self.assertEqual(stats["ACCESS_1"], (1, 0))
+        self.assertNotIn("ACCESS_2", stats)
+        self.assertIsNotNone(mt.current_location(self.conn, "00:50:79:66:68:30"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

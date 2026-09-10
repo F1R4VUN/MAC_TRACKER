@@ -526,41 +526,85 @@ def record_move(conn: sqlite3.Connection, mac: str, timestamp: str,
     )
 
 
+def kept_observations(result: SwitchResult, keep_uplinks: bool) -> list[Observation]:
+    """Uplink/trunk portlarindaki kayitlari (istenmiyorsa) ayiklar."""
+    if keep_uplinks:
+        return list(result.observations)
+    return [o for o in result.observations if o.port not in result.uplink_ports]
+
+
+def best_location_per_mac(results: list[SwitchResult],
+                          keep_uplinks: bool) -> dict[str, tuple[int, str, str, int]]:
+    """
+    Bir poll'da ayni MAC birden fazla switch'te gorulur: kendi access portunda
+    VE aradaki switch'lerin trunk portlarinda. Cihazin GERCEK yeri, uzerinde en
+    az MAC bulunan porttur (access portu her zaman trunk'i yener).
+
+    Doner: mac -> (port_macs, switch, port, vlan)
+    """
+    best: dict[str, tuple[int, str, str, int]] = {}
+    for result in results:
+        for obs in kept_observations(result, keep_uplinks):
+            candidate = (result.port_macs.get(obs.port, 1), result.entry.label, obs.port, obs.vlan)
+            current = best.get(obs.mac)
+            if current is None or candidate[0] < current[0]:
+                best[obs.mac] = candidate
+    return best
+
+
+def apply_poll_results(conn: sqlite3.Connection, results: list[SwitchResult],
+                       timestamp: str, keep_uplinks: bool) -> dict[str, tuple[int, int]]:
+    """
+    Bir poll'un TUM switch sonuclarini birlikte DB'ye yazar.
+
+    Hareket (port degisikligi) tespiti neden burada, switch bazinda degil:
+    ayni MAC ayni poll'da birden fazla switch'te gorunur. Her gozlemi ayri ayri
+    "onceki konumla" kiyaslarsan cihaz hic yer degistirmese bile her poll'da
+    sahte hareket kaydi uretirsin. Dogrusu: once poll'un tamamindan MAC basina
+    en iyi konumu sec, hareketi yalnizca o konum degistiyse yaz.
+
+    Doner: switch label -> (kaydedilen, atlanan_uplink)
+    """
+    ok_results = [r for r in results if r.ok]
+    stats: dict[str, tuple[int, int]] = {}
+
+    # 1) Bu poll'da gorulen MAC'lerin ONCEKI konumlari (upsert'ten once okunmali)
+    macs: set[str] = set()
+    for result in ok_results:
+        macs.update(o.mac for o in kept_observations(result, keep_uplinks))
+    previous = {mac: current_location(conn, mac) for mac in macs}
+
+    # 2) Gozlemleri yaz
+    for result in ok_results:
+        kept = kept_observations(result, keep_uplinks)
+        for obs in kept:
+            upsert_location(
+                conn,
+                mac=obs.mac,
+                switch=result.entry.label,
+                switch_ip=result.entry.switch,
+                port=obs.port,
+                vlan=obs.vlan,
+                timestamp=timestamp,
+                port_macs=result.port_macs.get(obs.port, 1),
+            )
+        stats[result.entry.label] = (len(kept), len(result.observations) - len(kept))
+    conn.commit()
+
+    # 3) Hareketleri poll'un tamamina bakarak yaz
+    for mac, (_, switch, port, vlan) in best_location_per_mac(ok_results, keep_uplinks).items():
+        prev = previous.get(mac)
+        if prev is not None and (prev["switch"], prev["port"]) != (switch, port):
+            record_move(conn, mac, timestamp, prev, switch, port, vlan)
+    conn.commit()
+    return stats
+
+
 def apply_switch_result(conn: sqlite3.Connection, result: SwitchResult,
                         timestamp: str, keep_uplinks: bool) -> tuple[int, int]:
-    """
-    Bir switch'ten gelen gozlemleri DB'ye yazar. (kaydedilen, atlanan_uplink) doner.
-    Tek transaction -- her satirda commit edilmez (bu cok daha hizli).
-    """
-    recorded = 0
-    skipped = 0
-    seen_in_this_switch: set[str] = set()
-    for obs in result.observations:
-        if not keep_uplinks and obs.port in result.uplink_ports:
-            skipped += 1
-            continue
-        prev = current_location(conn, obs.mac)
-        moved = (
-            prev is not None
-            and (prev["switch"], prev["port"]) != (result.entry.label, obs.port)
-            and obs.mac not in seen_in_this_switch
-        )
-        upsert_location(
-            conn,
-            mac=obs.mac,
-            switch=result.entry.label,
-            switch_ip=result.entry.switch,
-            port=obs.port,
-            vlan=obs.vlan,
-            timestamp=timestamp,
-            port_macs=result.port_macs.get(obs.port, 1),
-        )
-        if moved:
-            record_move(conn, obs.mac, timestamp, prev, result.entry.label, obs.port, obs.vlan)
-        seen_in_this_switch.add(obs.mac)
-        recorded += 1
-    conn.commit()
-    return recorded, skipped
+    """Tek switch'lik kisa yol (apply_poll_results uzerinden)."""
+    stats = apply_poll_results(conn, [result], timestamp, keep_uplinks)
+    return stats.get(result.entry.label, (0, 0))
 
 
 def record_poll_run(conn: sqlite3.Connection, result: SwitchResult, started_at: str,
@@ -1059,13 +1103,16 @@ def poll_once(conn: sqlite3.Connection, entries: list[SwitchEntry], opts: SnmpOp
     else:
         results = [work(entry) for entry in entries]
 
+    # Tum switch'ler tek seferde yazilir: hareket tespiti poll'un tamamini gormeli.
+    per_switch = apply_poll_results(conn, results, started, keep_uplinks)
+
     for result in results:
         if not result.ok:
             stats["failed"] += 1
             print(f"[{result.entry.label}] HATA: {result.error}", file=sys.stderr)
             record_poll_run(conn, result, started, recorded=0, uplinks=0)
             continue
-        recorded, skipped = apply_switch_result(conn, result, started, keep_uplinks)
+        recorded, skipped = per_switch.get(result.entry.label, (0, 0))
         record_poll_run(conn, result, started, recorded=recorded, uplinks=skipped)
         stats["ok"] += 1
         stats["observed"] += len(result.observations)

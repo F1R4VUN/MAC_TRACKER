@@ -236,7 +236,8 @@ NX-OS).
 
 | Ortam | Yol | Sonuc |
 |---|---|---|
-| Cisco IOL (L2), EVE-NG | `--collector ssh` | Calisiyor -- toplama, AKTIF/KOPMUS durumu, UPSERT davranisi ucdan uca dogrulandi |
+| Cisco IOL (L2), EVE-NG -- tek switch | `--collector ssh` | Calisiyor -- toplama, AKTIF/KOPMUS durumu, UPSERT davranisi ucdan uca dogrulandi |
+| Cisco IOL (L2), EVE-NG -- 5 switch (2 dist + 3 access, cift baglantili, STP'li) | `--collector ssh` | Calisiyor -- paralel toplama, uplink/trunk eleme, access portunun trunk'i yenmesi dogrulandi |
 | Cisco IOL (L2), EVE-NG | `--collector snmp` | **Calismiyor** -- imajda Q-BRIDGE MIB yok, `community@vlan` indexlemesi yok, VLAN context'i yok |
 
 IOL'de SNMP ile ogrenilenler (gercek Catalyst'te bunlarin cogu gecerli degildir,
@@ -251,6 +252,15 @@ ama benzer kisitli platformlarda ise yarar):
   yalnizca VLAN 1'in portlarini verir ve bridge-port numaralari VLAN'dan
   VLAN'a degisebilir. Bu yuzden dot1d modunda harita, FDB ile ayni VLAN
   context'i icinde okunur (aksi halde port adi `bridgeport<N>` olarak kalirdi).
+
+**Aging suresi.** Bir MAC, cihaz susunca aging-time (Cisco varsayilani 300 sn)
+sonunda FDB'den dusar. Lab'da poll'lar arasinda cihaz sessiz kalirsa "kayit yok"
+gorursun -- bu araç hatasi degil, switch'in tablosu gercekten bos. Lab testlerini
+deterministik yapmak icin:
+
+```
+switch(config)# mac address-table aging-time 1800
+```
 
 ## Sorun giderme
 
