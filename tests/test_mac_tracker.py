@@ -118,6 +118,39 @@ class TestInventory(unittest.TestCase):
         entries = mt.parse_inventory_csv(path)
         self.assertEqual([e.switch for e in entries], ["10.2.2.2"])
 
+    def test_comment_block_above_the_header(self):
+        # inventory.csv.example tam olarak boyle: aciklama blogu basligin
+        # ustunde. Bu satirlar elenmezse ilk yorum satiri baslik sanilir.
+        path = self._write(
+            "# Kopyala: cp inventory.csv.example inventory.csv\n"
+            "# switch : IP ya da hostname\n"
+            "\n"
+            "switch,community,vlans,label\n"
+            "10.1.1.1,public,,Kat1-SW\n")
+        entries = mt.parse_inventory_csv(path)
+        self.assertEqual([e.switch for e in entries], ["10.1.1.1"])
+
+    def test_shipped_example_file_is_usable(self):
+        # 'cp inventory.csv.example inventory.csv' sonrasi arac calismali.
+        example = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "inventory.csv.example")
+        entries = mt.parse_inventory_csv(example)
+        self.assertTrue(entries)
+        self.assertIn("router", {e.role for e in entries})
+
+    def test_error_points_at_the_real_file_line(self):
+        # Atlanan yorum satirlari satir numarasini kaydirmamali.
+        path = self._write(
+            "# aciklama\n"
+            "switch,community,vlans\n"
+            "10.1.1.1,public,10\n"
+            "# arada bir yorum\n"
+            "10.2.2.2,public,abc\n")
+        with self.assertRaises(ValueError) as ctx:
+            mt.parse_inventory_csv(path)
+        self.assertIn(":5:", str(ctx.exception))
+
     def test_bad_vlan_raises_clear_error(self):
         path = self._write("switch,community,vlans\n10.1.1.1,public,abc\n")
         with self.assertRaises(ValueError):

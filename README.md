@@ -58,7 +58,7 @@ pip3 install paramiko                 # ya da: apt install python3-paramiko
 cp inventory.csv.example inventory.csv
 $EDITOR inventory.csv
 
-# 3) Test (ag gerektirmez, 90 test)
+# 3) Test (ag gerektirmez, 93 test)
 python3 mac_tracker.py --selftest
 ```
 
@@ -318,7 +318,7 @@ python3 mac_tracker.py --selftest              # ya da
 python3 -m unittest discover -s tests -t . -v
 ```
 
-90 test; hicbiri gercek switch gerektirmez. SNMP katmani sahte `snmp_walk`
+93 test; hicbiri gercek switch gerektirmez. SNMP katmani sahte `snmp_walk`
 ile, SSH katmani sahte `ssh_fetch_mac_table` / `ssh_fetch_arp_table` ile,
 veritabani katmani `:memory:` DB ile test edilir. `show mac address-table` ve
 `show ip arp` parse testleri gercek cihaz ciktilarindan alinmis fixture'lar

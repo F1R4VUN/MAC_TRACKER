@@ -444,58 +444,68 @@ def parse_inventory_csv(path: str) -> list[SwitchEntry]:
         switch -> MAC adres tablosu (hangi port)
         router -> ARP tablosu (hangi IP hangi MAC'te)
         both   -> ikisi birden (ornegin SVI'li bir L3 switch)
-    '#' ile baslayan satirlar ve bos satirlar atlanir.
+    '#' ile baslayan satirlar ve bos satirlar atlanir -- baslik satirindan
+    once gelenler dahil, yani dosyanin basina aciklama blogu konabilir.
     """
     entries: list[SwitchEntry] = []
     with open(path, newline="", encoding="utf-8-sig") as handle:
-        reader = csv.DictReader(handle)
-        if reader.fieldnames is None:
-            raise ValueError(f"{path}: dosya bos ya da baslik satiri yok.")
-        headers = {(h or "").strip().lower() for h in reader.fieldnames}
-        if "switch" not in headers:
-            raise ValueError(
-                f"{path}: 'switch' kolonu yok. Beklenen baslik: "
-                f"switch,community,vlans[,label][,version][,role] -- bulunan: {reader.fieldnames}"
-            )
-        for lineno, row in enumerate(reader, start=2):
-            row = {(k or "").strip().lower(): (v or "").strip() for k, v in row.items()}
-            host = row.get("switch", "")
-            if not host or host.startswith("#"):
+        # Yorum ve bos satirlar BASLIKTAN ONCE de ayiklanir: aksi halde
+        # dosyanin basindaki '#' blogu baslik satiri sanilir ve dosya
+        # "'switch' kolonu yok" diye reddedilir.
+        numbered = [(lineno, line) for lineno, line in enumerate(handle, start=1)
+                    if line.strip() and not line.lstrip().startswith("#")]
+
+    reader = csv.DictReader(line for _, line in numbered)
+    if reader.fieldnames is None:
+        raise ValueError(f"{path}: dosya bos ya da baslik satiri yok.")
+    headers = {(h or "").strip().lower() for h in reader.fieldnames}
+    if "switch" not in headers:
+        raise ValueError(
+            f"{path}: 'switch' kolonu yok. Beklenen baslik: "
+            f"switch,community,vlans[,label][,version][,role] -- bulunan: {reader.fieldnames}"
+        )
+    # numbered[0] baslik satiridir; geri kalani veri satirlaridir. Satir
+    # numarasi dosyadaki GERCEK numaradir, boylece hata mesaji atlanmis
+    # yorum satirlari yuzunden yanlis yeri gostermez.
+    for (lineno, _), row in zip(numbered[1:], reader):
+        row = {(k or "").strip().lower(): (v or "").strip() for k, v in row.items()}
+        host = row.get("switch", "")
+        if not host:
+            continue
+        vlans: list[int] = []
+        for token in row.get("vlans", "").replace(",", ";").split(";"):
+            token = token.strip()
+            if not token:
                 continue
-            vlans: list[int] = []
-            for token in row.get("vlans", "").replace(",", ";").split(";"):
-                token = token.strip()
-                if not token:
-                    continue
-                try:
-                    vlan = int(token)
-                except ValueError as exc:
-                    raise ValueError(
-                        f"{path}:{lineno}: '{token}' gecerli bir VLAN ID degil."
-                    ) from exc
-                if not 1 <= vlan <= 4094:
-                    raise ValueError(f"{path}:{lineno}: VLAN {vlan} 1-4094 araliginda degil.")
-                vlans.append(vlan)
-            version = (row.get("version") or "2c").lower().replace("v", "") or "2c"
-            if version not in ("2c", "3"):
-                raise ValueError(f"{path}:{lineno}: desteklenmeyen SNMP surumu: {version!r} (2c ya da 3)")
-            role = (row.get("role") or "switch").lower()
-            if role not in ("switch", "router", "both"):
+            try:
+                vlan = int(token)
+            except ValueError as exc:
                 raise ValueError(
-                    f"{path}:{lineno}: gecersiz role: {role!r} (switch, router ya da both)"
-                )
-            entries.append(
-                SwitchEntry(
-                    switch=host,
-                    community=row.get("community", ""),
-                    vlans=vlans,
-                    label=row.get("label", ""),
-                    version=version,
-                    ssh_user=row.get("ssh_user", ""),
-                    ssh_pass=row.get("ssh_pass", ""),
-                    role=role,
-                )
+                    f"{path}:{lineno}: '{token}' gecerli bir VLAN ID degil."
+                ) from exc
+            if not 1 <= vlan <= 4094:
+                raise ValueError(f"{path}:{lineno}: VLAN {vlan} 1-4094 araliginda degil.")
+            vlans.append(vlan)
+        version = (row.get("version") or "2c").lower().replace("v", "") or "2c"
+        if version not in ("2c", "3"):
+            raise ValueError(f"{path}:{lineno}: desteklenmeyen SNMP surumu: {version!r} (2c ya da 3)")
+        role = (row.get("role") or "switch").lower()
+        if role not in ("switch", "router", "both"):
+            raise ValueError(
+                f"{path}:{lineno}: gecersiz role: {role!r} (switch, router ya da both)"
             )
+        entries.append(
+            SwitchEntry(
+                switch=host,
+                community=row.get("community", ""),
+                vlans=vlans,
+                label=row.get("label", ""),
+                version=version,
+                ssh_user=row.get("ssh_user", ""),
+                ssh_pass=row.get("ssh_pass", ""),
+                role=role,
+            )
+        )
     if not entries:
         raise ValueError(f"{path}: icinde kullanilabilir switch satiri bulunamadi.")
     return entries
