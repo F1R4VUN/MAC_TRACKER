@@ -7,6 +7,10 @@ gecmise donuk soyler.
 Kayip/calinmis laptop, "bu IP'yi kim kullaniyordu", "bu cihaz hangi portta
 takiliydi" tipi sorular icin.
 
+Elinde MAC degil IP varsa: gateway'lerin ARP tablosu da toplanir, boylece
+`--lookup-ip 10.10.10.20` zinciri tamamlar -> IP'den MAC'e, MAC'ten switch
+portuna.
+
 ## Nasil calisir
 
 Her poll'da her switch'in MAC adres tablosu (FDB) okunur ve her MAC icin
@@ -18,12 +22,27 @@ gorulurse yeni satir acilmaz**, sadece o kaydin `last_seen` alani guncellenir:
   bu portta aktifti"** cevabi tam olarak budur.
 * Cihaz port degistirirse bu hareket `mac_moves` tablosuna yazilir.
 
+ARP tarafi ayni mantikla calisir: gateway'in ARP tablosundaki her IP -> MAC
+eslemesi icin tek satir tutulur, esleme degismedikce `last_seen` guncellenir.
+IP baska bir MAC'e gecerse (DHCP yeniden dagitimi, cihaz degisimi) yeni satir
+acilir ve eskisi gecmis olarak kalir.
+
 ```
-switch (SNMP) --> mac_tracker.py --> mac_tracker.db (SQLite dosyasi)
-                                        mac_locations : mac + switch + port + first_seen/last_seen
-                                        mac_moves     : port degisiklikleri
-                                        poll_runs     : her switch'in her poll sonucu
+switch (SNMP/SSH) --> mac_tracker.py --> mac_tracker.db (SQLite dosyasi)
+router (SNMP/SSH) -->                       mac_locations : mac + switch + port + first_seen/last_seen
+                                            mac_moves     : port degisiklikleri
+                                            arp_sightings : ip + mac + kaynak cihaz + first_seen/last_seen
+                                            poll_runs     : her cihazin her poll sonucu (kind=mac|arp)
 ```
+
+Zincir:
+
+```
+IP --(gateway'in ARP tablosu)--> MAC --(switch FDB'si)--> switch + port
+```
+
+ARP router'i **asmaz**; tek yaptigi IP'yi MAC'e cevirmektir. Cihazin portunu
+bulabilmek icin cihazin kendi segmentindeki switch de envanterde olmalidir.
 
 ## Kurulum
 
@@ -39,7 +58,7 @@ pip3 install paramiko                 # ya da: apt install python3-paramiko
 cp inventory.csv.example inventory.csv
 $EDITOR inventory.csv
 
-# 3) Test (ag gerektirmez, 53 test)
+# 3) Test (ag gerektirmez, 90 test)
 python3 mac_tracker.py --selftest
 ```
 
@@ -104,6 +123,10 @@ python3 mac_tracker.py --lookup AA:BB:CC:DD:EE:FF
 # Tum konum gecmisi + port degisiklikleri
 python3 mac_tracker.py --history AA:BB:CC:DD:EE:FF
 
+# Elinde MAC degil IP varsa (envanterde role=router bir cihaz sart)
+python3 mac_tracker.py --lookup-ip 10.10.10.20
+python3 mac_tracker.py --ip-history 10.10.10.20
+
 # Bir portta / bir switch'te neler gorulmus
 python3 mac_tracker.py --port Gi1/0/5
 python3 mac_tracker.py --port Gi1/0/5 --switch Kat1-SW
@@ -125,6 +148,7 @@ Durum        : KOPMUS (bu portta son aktiflik: 3 gun 0 saat once)
 Switch       : Kat1-SW (10.1.1.1)
 Port         : Gi1/0/9
 VLAN         : 10
+IP           : 10.10.10.20  (ARP: Gateway-RTR, 3 gun 0 saat once)
 Ilk gorulme  : 2026-09-07 21:10:48 +0300
 Son gorulme  : 2026-09-07 21:10:48 +0300  (3 gun 0 saat once)
 Gorulme sayisi: 1 poll
@@ -139,6 +163,71 @@ Portta MAC   : 1
 | `KOPMUS` | Switch sorgulanabiliyor ama cihaz artik FDB'de yok -> `Son gorulme` gercek kopma zamanidir |
 | `BILINMIYOR` | Switch'e ulasilamiyor; cihaz hakkinda yorum yapilamaz (cihaz kopmasi ile switch kopmasi karistirilmaz) |
 
+### IP ile arama (ARP)
+
+ARP tablosu **yalnizca o subnet'in gateway'inde** olusur: L2 switch'ler IP
+gormez. Bu yuzden IP ile arama yapabilmek icin gateway'i (router ya da SVI'si
+olan L3 switch) envantere `role=router` ile eklemek gerekir:
+
+```csv
+switch,community,vlans,label,version,role
+10.1.1.1,public,,Kat1-SW,2c,switch
+10.1.0.1,public,,Core-L3,2c,both
+10.1.0.254,public,,Gateway-RTR,2c,router
+```
+
+| role | Cihazdan ne okunur |
+|---|---|
+| `switch` | **Varsayilan.** MAC adres tablosu (FDB): cihaz hangi portta |
+| `router` | ARP tablosu: hangi IP hangi MAC'te |
+| `both` | Ikisi birden -- SVI'si olan bir L3 switch icin |
+
+Toplama tarafinda ek bir komut yok; `--once` / `--loop` her iki tabloyu da
+role'e gore okur:
+
+```
+[ACCESS_1] ssh: 4 MAC kaydedildi
+[Gateway-RTR] arp-ssh: 11 IP->MAC eslemesi kaydedildi
+Poll bitti: 5/5 switch ok, 12 MAC kaydi, 3 uplink kaydi atlandi; ARP: 1/1 cihaz ok, 11 IP->MAC
+```
+
+Ornek `--lookup-ip` cikisi -- once ARP, sonra konum:
+
+```
+IP           : 10.10.10.20
+MAC          : 00:50:79:66:68:01
+ARP kaynagi  : Gateway-RTR Vlan10  (az once)
+
+MAC          : 00:50:79:66:68:01
+Durum        : AKTIF (son pollde bu portta goruldu)
+Switch       : ACCESS_2 (192.168.1.212)
+Port         : Et0/3
+VLAN         : 10
+...
+```
+
+ARP okumasi da `--collector` ayarini takip eder: `snmp` yolunda IP-MIB
+`ipNetToMediaPhysAddress` (tek walk, VLAN context'i gerektirmez), `ssh`
+yolunda `show ip arp`. Parse edici IOS, IOS-XE ve NX-OS ciktilarini tanir;
+`Incomplete` kayitlar atlanir (cozulememis bir ARP istegi, o IP'de bir cihaz
+oldugu anlamina gelmez). Komut gerekirse degistirilebilir:
+`--ssh-arp-command "show ip arp vrf MGMT"`.
+
+Iki sinir:
+
+* ARP router'i asmaz. Uzak bir subnet'teki cihaz icin o subnet'in gateway'i
+  de envanterde olmalidir.
+* ARP kaydi bir IP'yi MAC'e cevirir, portu vermez. MAC hicbir switch'in
+  FDB'sinde yoksa `--lookup-ip` bunu acikca soyler -- cihazin segmentindeki
+  switch envante disindadir.
+
+Bir IP zaman icinde birden fazla MAC'te gorulduyse (DHCP havuzu) hepsi
+saklanir:
+
+```bash
+python3 mac_tracker.py --ip-history 10.10.10.20
+```
+
 ## Onemli detaylar
 
 **Veri kaynagi (`--collector`)**
@@ -147,6 +236,9 @@ Portta MAC   : 1
 |---|---|
 | `snmp` | **Varsayilan.** FDB'yi SNMP ile okur (asagidaki `--mode`). |
 | `ssh` | Cihaza SSH ile baglanip `show mac address-table` ciktisini parse eder. VLAN + MAC + port tek komutta gelir, MIB destegine ihtiyac yoktur. `pip3 install paramiko` gerekir. |
+
+Secim ARP tarafini da belirler: `snmp` -> `ipNetToMediaPhysAddress`,
+`ssh` -> `show ip arp`.
 
 SSH yolu ne zaman gerekir: bazi platformlarda -- ozellikle EVE-NG/GNS3'teki
 **IOL/IOU imajlari** -- Q-BRIDGE MIB yoktur, Cisco'nun `community@vlan`
@@ -226,11 +318,11 @@ python3 mac_tracker.py --selftest              # ya da
 python3 -m unittest discover -s tests -t . -v
 ```
 
-53 test; hicbiri gercek switch gerektirmez. SNMP katmani sahte `snmp_walk`
-ile, SSH katmani sahte `ssh_fetch_mac_table` ile, veritabani katmani
-`:memory:` DB ile test edilir. `show mac address-table` parse testleri
-gercek cihaz ciktilarindan alinmis fixture'lar kullanir (IOS/IOL, IOS-XE,
-NX-OS).
+90 test; hicbiri gercek switch gerektirmez. SNMP katmani sahte `snmp_walk`
+ile, SSH katmani sahte `ssh_fetch_mac_table` / `ssh_fetch_arp_table` ile,
+veritabani katmani `:memory:` DB ile test edilir. `show mac address-table` ve
+`show ip arp` parse testleri gercek cihaz ciktilarindan alinmis fixture'lar
+kullanir (IOS/IOL, IOS-XE, NX-OS).
 
 ## Dogrulanmis ortamlar
 
@@ -239,6 +331,7 @@ NX-OS).
 | Cisco IOL (L2), EVE-NG -- tek switch | `--collector ssh` | Calisiyor -- toplama, AKTIF/KOPMUS durumu, UPSERT davranisi ucdan uca dogrulandi |
 | Cisco IOL (L2), EVE-NG -- 5 switch (2 dist + 3 access, cift baglantili, STP'li) | `--collector ssh` | Calisiyor -- paralel toplama, uplink/trunk eleme, access portunun trunk'i yenmesi, cihazi baska switch'e tasiyinca **tek** hareket kaydi uretilmesi dogrulandi |
 | Cisco IOL (L2), EVE-NG | `--collector snmp` | **Calismiyor** -- imajda Q-BRIDGE MIB yok, `community@vlan` indexlemesi yok, VLAN context'i yok |
+| ARP toplama (`role=router`) | `--collector ssh` / `snmp` | **Labda henuz dogrulanmadi.** Test topolojisi saf L2; ARP tablosunun olusmasi icin once VLAN 10/20 icin SVI + `ip routing` tasiyan bir router ya da L3 switch eklenmeli. Parse tarafi gercek cihaz cikti formatlariyla test edildi, ucdan uca akis degil. |
 
 IOL'de SNMP ile ogrenilenler (gercek Catalyst'te bunlarin cogu gecerli degildir,
 ama benzer kisitli platformlarda ise yarar):
@@ -334,6 +427,9 @@ switch(config)# mac address-table aging-time 1800
 | `Envanter okunamadi: ... switch satiri bulunamadi` | CSV tek satira yapismis. PowerShell'de satir sonu icin backtick (`` `n ``) gerekir; en saglami: `Set-Content -Encoding ascii inventory.csv @("switch,community,vlans,label","10.1.1.1,,,SW1")` |
 | `MAC tablosu bos ya da anlasilamadi` (ssh) | Komut kabul edilmemis olabilir: `--ssh-command "show mac-address-table"` (tireli) dene. Router'da MAC tablosu yoktur, envantere sadece switch/L3 switch koy. |
 | Cihaz switch'te gorunuyor ama `--lookup` bulmuyor | DB ancak yeni bir poll'da guncellenir; once `--once` calistir. |
+| `--lookup-ip` "ARP kaydi yok" diyor | O subnet'in gateway'i envanterde `role=router` (ya da `both`) ile tanimli mi? L2 switch'te ARP tablosu yoktur. Bir de ARP kaydi ancak gateway o IP ile konustuysa olusur -- cihaza ping atip poll'u tekrarla. |
+| `--lookup-ip` MAC'i buluyor ama portu bulmuyor | ARP router'i asmaz: cihazin kendi segmentindeki switch de envanterde olmali ve basarili pollenebilmeli. `--summary` ile o switch'in poll durumuna bak. |
+| `ARP tablosu bos ya da anlasilamadi` (ssh) | Cihazda ARP tablosu gercekten bos olabilir (L2 switch'e `role=router` verilmis). VRF kullaniliyorsa: `--ssh-arp-command "show ip arp vrf <ad>"`. |
 
 ## Tum secenekler
 

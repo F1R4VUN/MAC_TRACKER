@@ -6,7 +6,10 @@ Calistirma:
     python mac_tracker.py --selftest
 """
 
+import contextlib
+import io
 import os
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -610,6 +613,374 @@ class TestMultiSwitchPoll(DbTestCase):
         self.assertEqual(stats["ACCESS_1"], (1, 0))
         self.assertNotIn("ACCESS_2", stats)
         self.assertIsNotNone(mt.current_location(self.conn, "00:50:79:66:68:30"))
+
+
+# ---------------------------------------------------------------------------
+# ARP TOPLAMA
+# ---------------------------------------------------------------------------
+
+# Asagidaki ciktilar gercek cihaz formatlaridir.
+IOS_ARP_TABLE = """R1#show ip arp
+Protocol  Address          Age (min)  Hardware Addr   Type   Interface
+Internet  192.168.1.201           -   aabb.cc00.0100  ARPA   Vlan99
+Internet  192.168.1.10           12   0050.7966.6800  ARPA   Vlan99
+Internet  10.10.10.1              -   aabb.cc00.0110  ARPA   Vlan10
+Internet  10.10.10.20             3   0050.7966.6801  ARPA   Vlan10
+Internet  10.20.20.30             0   Incomplete      ARPA
+R1#"""
+
+IOSXE_ARP_TABLE = """Protocol  Address          Age (min)  Hardware Addr   Type   Interface
+Internet  10.30.30.1              -   0050.7966.6810  ARPA   GigabitEthernet0/0/1
+Internet  10.30.30.55            41   a0b1.c2d3.e4f5  ARPA   GigabitEthernet0/0/1"""
+
+NXOS_ARP_TABLE = """Flags: * - Adjacencies learnt on non-active FHRP router
+       + - Adjacencies synced via CFSoE
+       # - Adjacencies Throttled for Glean
+
+IP ARP Table for context default
+Total number of entries: 3
+Address         Age       MAC Address     Interface       Flags
+10.10.10.1      00:12:33  aabb.cc00.0200  Vlan10
+10.10.10.21     00:00:14  0050.7966.6802  Vlan10
+*10.10.10.22    00:04:02  0050.7966.6803  Eth1/5"""
+
+
+class TestIpHelpers(unittest.TestCase):
+    def test_normalize_ip(self):
+        self.assertEqual(mt.normalize_ip(" 192.168.1.10 "), "192.168.1.10")
+
+    def test_invalid_ip_raises(self):
+        for bad in ("192.168.1.300", "192.168.1", "abc", "", "10.0.0.1/24"):
+            with self.assertRaises(ValueError):
+                mt.normalize_ip(bad)
+
+    def test_ip_from_arp_oid(self):
+        self.assertEqual(
+            mt.ip_from_arp_oid("1.3.6.1.2.1.4.22.1.2.3.192.168.1.10"), "192.168.1.10")
+
+    def test_arp_oid_index_has_ifindex(self):
+        self.assertEqual(
+            mt.arp_index_from_oid("1.3.6.1.2.1.4.22.1.2.12.10.10.10.20"),
+            (12, "10.10.10.20"))
+
+    def test_bad_arp_oid_raises(self):
+        for bad in ("1.3.6.1", "1.3.6.1.2.1.4.22.1.2.3.192.168.1.999"):
+            with self.assertRaises(ValueError):
+                mt.ip_from_arp_oid(bad)
+
+    def test_mac_from_snmp_value_both_formats(self):
+        # MIB yuklu: 'aa:bb:...'   MIB yok: 'AA BB CC DD EE FF'
+        self.assertEqual(mt.mac_from_snmp_value("00:50:79:66:68:00"), "00:50:79:66:68:00")
+        self.assertEqual(mt.mac_from_snmp_value("00 50 79 66 68 00 "), "00:50:79:66:68:00")
+
+
+class TestArpTableParsing(unittest.TestCase):
+    """'show ip arp' parse'i -- gercek cihaz ciktilari uzerinden."""
+
+    def test_ios_output(self):
+        arps = mt.parse_ip_arp_table(IOS_ARP_TABLE)
+        by_ip = {a.ip: a for a in arps}
+        self.assertEqual(len(arps), 4)          # 'Incomplete' satiri sayilmaz
+        self.assertEqual(by_ip["10.10.10.20"].mac, "00:50:79:66:68:01")
+        self.assertEqual(by_ip["10.10.10.20"].interface, "Vlan10")
+
+    def test_incomplete_entries_skipped(self):
+        # Cozulememis ARP istegi, o IP'de bir cihaz oldugu anlamina gelmez.
+        arps = mt.parse_ip_arp_table(IOS_ARP_TABLE)
+        self.assertNotIn("10.20.20.30", {a.ip for a in arps})
+
+    def test_router_own_svi_is_kept(self):
+        # Age '-' olan kayitlar router'in kendi arayuz adresleridir; gateway'in
+        # MAC'ini bilmek ise ise yarar.
+        arps = {a.ip: a for a in mt.parse_ip_arp_table(IOS_ARP_TABLE)}
+        self.assertEqual(arps["10.10.10.1"].mac, "AA:BB:CC:00:01:10")
+
+    def test_iosxe_long_interface_names(self):
+        arps = {a.ip: a for a in mt.parse_ip_arp_table(IOSXE_ARP_TABLE)}
+        self.assertEqual(arps["10.30.30.55"].mac, "A0:B1:C2:D3:E4:F5")
+        self.assertEqual(arps["10.30.30.55"].interface, "GigabitEthernet0/0/1")
+
+    def test_nxos_output(self):
+        arps = mt.parse_ip_arp_table(NXOS_ARP_TABLE)
+        by_ip = {a.ip: a for a in arps}
+        self.assertEqual(len(arps), 3)
+        # Basliklar, bayrak aciklamalari ve 'Total number of entries' satiri elenmeli
+        self.assertEqual(by_ip["10.10.10.22"].mac, "00:50:79:66:68:03")
+        self.assertEqual(by_ip["10.10.10.22"].interface, "Eth1/5")
+        # NX-OS'un 'Age' kolonu (00:12:33) MAC sanilmamali
+        self.assertEqual(by_ip["10.10.10.1"].mac, "AA:BB:CC:00:02:00")
+
+    def test_garbage_input_is_safe(self):
+        self.assertEqual(mt.parse_ip_arp_table(""), [])
+        self.assertEqual(mt.parse_ip_arp_table("% Invalid input detected"), [])
+        self.assertEqual(mt.parse_ip_arp_table("999.1.1.1  -  aabb.cc00.0100  ARPA  Vl1"), [])
+
+
+class TestInventoryRole(unittest.TestCase):
+    def _write(self, text):
+        handle = tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False, encoding="utf-8")
+        handle.write(text)
+        handle.close()
+        self.addCleanup(os.unlink, handle.name)
+        return handle.name
+
+    def test_default_role_is_switch(self):
+        entries = mt.parse_inventory_csv(self._write(
+            "switch,community,vlans,label\n10.1.1.1,public,,SW1\n"))
+        self.assertEqual(entries[0].role, "switch")
+        self.assertTrue(entries[0].collects_macs)
+        self.assertFalse(entries[0].collects_arp)
+
+    def test_router_and_both(self):
+        entries = mt.parse_inventory_csv(self._write(
+            "switch,community,vlans,label,version,role\n"
+            "10.1.0.1,public,,GW,2c,router\n"
+            "10.1.0.2,public,,L3SW,2c,both\n"))
+        router, l3 = entries
+        self.assertEqual((router.collects_macs, router.collects_arp), (False, True))
+        self.assertEqual((l3.collects_macs, l3.collects_arp), (True, True))
+
+    def test_invalid_role_raises_clear_error(self):
+        with self.assertRaises(ValueError) as ctx:
+            mt.parse_inventory_csv(self._write(
+                "switch,community,vlans,label,version,role\n10.1.0.1,public,,GW,2c,firewall\n"))
+        self.assertIn("role", str(ctx.exception))
+
+
+class TestArpStorage(DbTestCase):
+    def _arp_result(self, label, pairs, ip="192.168.1.254"):
+        entry = mt.SwitchEntry(switch=ip, community="public", label=label, role="router")
+        arps = [mt.ArpEntry(ip=i, mac=m, interface=iface) for i, m, iface in pairs]
+        return mt.ArpResult(entry=entry, arps=arps, mode_used="arp-ssh")
+
+    def test_repeat_polls_do_not_create_new_rows(self):
+        result = self._arp_result("GW", [("10.10.10.20", "00:50:79:66:68:01", "Vlan10")])
+        for index in range(4):
+            mt.apply_arp_results(self.conn, [result], f"2026-09-11T10:0{index}:00Z")
+        rows = self.conn.execute("SELECT * FROM arp_sightings").fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["seen_count"], 4)
+        self.assertEqual(rows[0]["first_seen"], "2026-09-11T10:00:00Z")
+        self.assertEqual(rows[0]["last_seen"], "2026-09-11T10:03:00Z")
+
+    def test_new_mac_for_same_ip_keeps_history(self):
+        mt.apply_arp_results(self.conn, [self._arp_result(
+            "GW", [("10.10.10.20", "00:50:79:66:68:01", "Vlan10")])], "2026-09-11T10:00:00Z")
+        mt.apply_arp_results(self.conn, [self._arp_result(
+            "GW", [("10.10.10.20", "00:50:79:66:68:09", "Vlan10")])], "2026-09-11T11:00:00Z")
+        rows = self.conn.execute(
+            "SELECT * FROM arp_sightings WHERE ip = '10.10.10.20'").fetchall()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(mt.current_mac_for_ip(self.conn, "10.10.10.20")["mac"],
+                         "00:50:79:66:68:09")
+
+    def test_failed_result_writes_nothing(self):
+        bad = self._arp_result("GW", [("10.10.10.20", "00:50:79:66:68:01", "Vlan10")])
+        bad.error = "SSH hatasi: timeout"
+        stats = mt.apply_arp_results(self.conn, [bad], "2026-09-11T10:00:00Z")
+        self.assertEqual(stats, {})
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) AS n FROM arp_sightings").fetchone()["n"], 0)
+
+    def test_ip_for_mac_lookup(self):
+        mt.apply_arp_results(self.conn, [self._arp_result(
+            "GW", [("10.10.10.20", "00:50:79:66:68:01", "Vlan10")])], "2026-09-11T10:00:00Z")
+        self.assertEqual(
+            mt.current_ip_for_mac(self.conn, "00:50:79:66:68:01")["ip"], "10.10.10.20")
+        self.assertIsNone(mt.current_ip_for_mac(self.conn, "00:00:00:00:00:01"))
+
+    def test_lookup_ip_says_so_when_mac_is_in_no_fdb(self):
+        # ARP IP'yi MAC'e cevirdi ama cihazin switch'i envanterde degil:
+        # "kayit yok" yerine nedenini soylemeli.
+        mt.apply_arp_results(self.conn, [self._arp_result(
+            "GW", [("10.10.10.20", "00:50:79:66:68:01", "Vlan10")])], "2026-09-11T10:00:00Z")
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            mt.cmd_lookup_ip(self.conn, "10.10.10.20", 15)
+        output = buffer.getvalue()
+        self.assertIn("00:50:79:66:68:01", output)
+        self.assertIn("hicbir switch", output)
+
+    def test_prune_removes_old_arp_rows(self):
+        old = (datetime.now(timezone.utc) - timedelta(days=400)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        mt.apply_arp_results(self.conn, [self._arp_result(
+            "GW", [("10.10.10.20", "00:50:79:66:68:01", "Vlan10")])], old)
+        mt.cmd_prune(self.conn, 365)
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) AS n FROM arp_sightings").fetchone()["n"], 0)
+
+
+class TestArpCollectors(unittest.TestCase):
+    """ARP toplayicilari -- gercek SSH/SNMP baglantisi olmadan."""
+
+    def setUp(self):
+        self.real_fetch = mt.ssh_fetch_arp_table
+        self.addCleanup(setattr, mt, "ssh_fetch_arp_table", self.real_fetch)
+        self.real_walk = mt.snmp_walk
+        self.addCleanup(setattr, mt, "snmp_walk", self.real_walk)
+        self.entry = mt.SwitchEntry(switch="192.168.1.254", community="public",
+                                    label="GW", role="router")
+
+    def test_ssh_collect(self):
+        mt.ssh_fetch_arp_table = lambda entry, opts, verbose=False: IOS_ARP_TABLE
+        result = mt.collect_arp_ssh(self.entry, mt.SshOptions(user="admin"))
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(result.mode_used, "arp-ssh")
+        self.assertEqual(len(result.arps), 4)
+
+    def test_ssh_failure_reported_not_raised(self):
+        def boom(entry, opts, verbose=False):
+            raise mt.SnmpError("SSH hatasi: AuthenticationException")
+        mt.ssh_fetch_arp_table = boom
+        result = mt.collect_arp_ssh(self.entry, mt.SshOptions(user="admin"))
+        self.assertFalse(result.ok)
+        self.assertIn("AuthenticationException", result.error)
+
+    def test_ssh_empty_table_is_an_error_not_silent_success(self):
+        mt.ssh_fetch_arp_table = lambda entry, opts, verbose=False: "R1#\nR1#"
+        result = mt.collect_arp_ssh(self.entry, mt.SshOptions(user="admin"))
+        self.assertFalse(result.ok)
+
+    def _fake_walk(self, types=None):
+        phys = {
+            "1.3.6.1.2.1.4.22.1.2.7.10.10.10.1": "aa:bb:cc:00:01:10",
+            "1.3.6.1.2.1.4.22.1.2.7.10.10.10.20": "00 50 79 66 68 01",
+            "1.3.6.1.2.1.4.22.1.2.7.10.10.10.99": "00:50:79:66:68:99",
+        }
+        type_rows = types if types is not None else {}
+
+        def walk(entry, opts, oid, vlan=None):
+            if oid == mt.OID_IPNETTOMEDIA_PHYS:
+                return list(phys.items())
+            if oid == mt.OID_IPNETTOMEDIA_TYPE:
+                return list(type_rows.items())
+            if oid == mt.OID_IFNAME:
+                return [(f"{mt.OID_IFNAME}.7", "Vlan10")]
+            return []
+        return walk
+
+    def test_snmp_collect_maps_ip_mac_and_interface(self):
+        mt.snmp_walk = self._fake_walk()
+        result = mt.collect_arp_snmp(self.entry, mt.SnmpOptions(walk_binary="snmpwalk"))
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(result.mode_used, "arp-snmp")
+        by_ip = {a.ip: a for a in result.arps}
+        self.assertEqual(by_ip["10.10.10.20"].mac, "00:50:79:66:68:01")
+        self.assertEqual(by_ip["10.10.10.20"].interface, "Vlan10")
+
+    def test_snmp_invalid_entries_filtered(self):
+        mt.snmp_walk = self._fake_walk(
+            types={"1.3.6.1.2.1.4.22.1.4.7.10.10.10.99": str(mt.ARP_TYPE_INVALID)})
+        result = mt.collect_arp_snmp(self.entry, mt.SnmpOptions(walk_binary="snmpwalk"))
+        self.assertNotIn("10.10.10.99", {a.ip for a in result.arps})
+        self.assertEqual(len(result.arps), 2)
+
+    def test_snmp_empty_table_is_an_error(self):
+        mt.snmp_walk = lambda entry, opts, oid, vlan=None: []
+        result = mt.collect_arp_snmp(self.entry, mt.SnmpOptions(walk_binary="snmpwalk"))
+        self.assertFalse(result.ok)
+
+    def test_snmp_garbage_values_do_not_crash(self):
+        def walk(entry, opts, oid, vlan=None):
+            if oid == mt.OID_IPNETTOMEDIA_PHYS:
+                return [("1.3.6.1.2.1.4.22.1.2.7.10.10.10.1", "No Such Object"),
+                        ("bozuk.oid", "zzzz"),
+                        ("1.3.6.1.2.1.4.22.1.2.7.10.10.10.5", "00:50:79:66:68:05")]
+            return []
+        mt.snmp_walk = walk
+        result = mt.collect_arp_snmp(self.entry, mt.SnmpOptions(walk_binary="snmpwalk"))
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual([a.ip for a in result.arps], ["10.10.10.5"])
+
+
+class TestPollWithRoles(DbTestCase):
+    """role kolonu: switch'ten FDB, router'dan ARP okunur."""
+
+    def setUp(self):
+        super().setUp()
+        for name in ("collect_switch_ssh", "collect_arp_ssh"):
+            self.addCleanup(setattr, mt, name, getattr(mt, name))
+        self.mac_calls = []
+        self.arp_calls = []
+
+        def fake_mac(entry, opts, uplink_threshold, verbose=False):
+            self.mac_calls.append(entry.label)
+            result = mt.SwitchResult(entry=entry, mode_used="ssh",
+                                     observations=[mt.Observation("00:50:79:66:68:01", 10, "Et0/3")])
+            result.port_macs = {"Et0/3": 1}
+            return result
+
+        def fake_arp(entry, opts, verbose=False):
+            self.arp_calls.append(entry.label)
+            return mt.ArpResult(entry=entry, mode_used="arp-ssh",
+                                arps=[mt.ArpEntry("10.10.10.20", "00:50:79:66:68:01", "Vlan10")])
+
+        mt.collect_switch_ssh = fake_mac
+        mt.collect_arp_ssh = fake_arp
+        self.entries = [
+            mt.SwitchEntry(switch="192.168.1.211", label="ACCESS_1"),
+            mt.SwitchEntry(switch="192.168.1.254", label="GW", role="router"),
+        ]
+
+    def _poll(self):
+        return mt.poll_once(self.conn, self.entries, mt.SnmpOptions(), "auto", 10,
+                            False, True, workers=1, collector="ssh",
+                            ssh_opts=mt.SshOptions(user="admin"))
+
+    def test_router_is_not_asked_for_a_mac_table(self):
+        stats = self._poll()
+        self.assertEqual(self.mac_calls, ["ACCESS_1"])
+        self.assertEqual(self.arp_calls, ["GW"])
+        self.assertEqual(stats["recorded"], 1)
+        self.assertEqual(stats["arp_recorded"], 1)
+
+    def test_ip_resolves_to_switch_port(self):
+        self._poll()
+        arp = mt.current_mac_for_ip(self.conn, "10.10.10.20")
+        self.assertEqual(arp["mac"], "00:50:79:66:68:01")
+        loc = mt.current_location(self.conn, arp["mac"])
+        self.assertEqual((loc["switch"], loc["port"]), ("ACCESS_1", "Et0/3"))
+
+    def test_arp_run_does_not_count_as_a_mac_poll(self):
+        # 'Cihaz koptu mu, switch'e mi ulasamiyoruz' ayrimi yalnizca FDB
+        # okumalarina bakmali: ARP'in basarili olmasi FDB'yi okudugumuzu
+        # gostermez.
+        self._poll()
+        self.assertIsNone(mt.last_successful_poll(self.conn, "GW"))
+        self.assertIsNotNone(mt.last_successful_poll(self.conn, "GW", kind="arp"))
+        self.assertIsNotNone(mt.last_successful_poll(self.conn, "ACCESS_1"))
+
+
+class TestSchemaMigration(unittest.TestCase):
+    """Eski surumle acilmis bir DB, kind kolonu eklenerek kullanilabilmeli."""
+
+    def test_kind_column_added_to_existing_db(self):
+        handle = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        handle.close()
+        self.addCleanup(os.unlink, handle.name)
+        old = sqlite3.connect(handle.name)
+        old.executescript(
+            "CREATE TABLE poll_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "switch TEXT NOT NULL, switch_ip TEXT NOT NULL DEFAULT '', "
+            "started_at TEXT NOT NULL, finished_at TEXT NOT NULL, ok INTEGER NOT NULL, "
+            "mode_used TEXT NOT NULL DEFAULT '', observed INTEGER NOT NULL DEFAULT 0, "
+            "recorded INTEGER NOT NULL DEFAULT 0, uplinks INTEGER NOT NULL DEFAULT 0, "
+            "error TEXT NOT NULL DEFAULT '');"
+            "INSERT INTO poll_runs (switch, started_at, finished_at, ok) "
+            "VALUES ('SW1', '2026-09-01T10:00:00Z', '2026-09-01T10:00:02Z', 1);"
+        )
+        old.commit()
+        old.close()
+
+        conn = mt.init_db(handle.name)
+        self.addCleanup(conn.close)
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(poll_runs)")}
+        self.assertIn("kind", columns)
+        # Eski satirlar MAC pollu sayilir, ARP degil.
+        self.assertEqual(conn.execute("SELECT kind FROM poll_runs").fetchone()["kind"], "mac")
+        self.assertIsNotNone(mt.last_successful_poll(conn, "SW1"))
+        # Ikinci acilis bir sey degistirmemeli.
+        self.assertEqual(mt.migrate_db(conn), [])
 
 
 if __name__ == "__main__":
