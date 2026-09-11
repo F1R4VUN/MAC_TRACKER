@@ -518,6 +518,32 @@ class TestMacAddressTableParsing(unittest.TestCase):
         self.assertEqual(mt.find_uplink_ports(observations, 2), {"Et0/3"})
 
 
+class TestAlternateMacCommand(unittest.TestCase):
+    """Eski IOS'larda komut tireli: 'show mac-address-table'."""
+
+    def test_spaced_to_hyphenated(self):
+        self.assertEqual(mt.alternate_mac_command("show mac address-table"),
+                         "show mac-address-table")
+
+    def test_hyphenated_to_spaced(self):
+        self.assertEqual(mt.alternate_mac_command("show mac-address-table"),
+                         "show mac address-table")
+
+    def test_extra_arguments_are_kept(self):
+        self.assertEqual(mt.alternate_mac_command("show mac address-table vlan 10"),
+                         "show mac-address-table vlan 10")
+
+    def test_unknown_command_has_no_alternate(self):
+        # Kor bir alternatif uretip ayni hatayi ikinci kez almanin anlami yok.
+        self.assertIsNone(mt.alternate_mac_command("show ip arp"))
+
+    def test_alternate_actually_differs_from_the_original(self):
+        # Eski hata tam buradaydi: 'address-table' zaten tire icerdigi icin
+        # uretilen "alternatif" orijinal komutun aynisi oluyordu.
+        for command in ("show mac address-table", "show mac-address-table"):
+            self.assertNotEqual(mt.alternate_mac_command(command), command)
+
+
 class TestSshCollectorWithFakeTransport(unittest.TestCase):
     """collect_switch_ssh -- gercek SSH baglantisi olmadan."""
 

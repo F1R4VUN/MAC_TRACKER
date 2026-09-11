@@ -1354,16 +1354,31 @@ def _read_until_idle(channel, idle: float = 1.0, total: float = 20.0) -> str:
     return "".join(buffer)
 
 
+def alternate_mac_command(command: str) -> str | None:
+    """
+    'show mac address-table' <-> 'show mac-address-table' arasinda gecis yapar:
+    eski IOS'lar tireli sozdizimini ister, yenileri bosluklu olani. Komutun
+    geri kalani korunur, boylece 'show mac address-table vlan 10' gibi ek
+    argumanli komutlar da dogru alternatifi uretir.
+
+    Taninmayan bir komut icin None doner: kor bir alternatif uretip ayni
+    hatayi ikinci kez almanin anlami yok.
+    """
+    if "mac address-table" in command:
+        return command.replace("mac address-table", "mac-address-table", 1)
+    if "mac-address-table" in command:
+        return command.replace("mac-address-table", "mac address-table", 1)
+    return None
+
+
 def ssh_fetch_mac_table(entry: SwitchEntry, opts: SshOptions, verbose: bool = False) -> str:
     """
     Switch'e SSH ile baglanip MAC adres tablosunu getirir. Ciktiyi ham metin
     olarak doner. Basarisizlikta SnmpError firlatir (ayni hata yolu kullanilsin
     diye; mesajda yontem belirtilir).
     """
-    # Eski IOS'larda komut 'show mac-address-table' (tireli) olabiliyor
-    alternate = ("show mac-address-table"
-                 if "-" not in opts.command else "show mac address-table")
-    return _ssh_run_command(entry, opts, opts.command, alternate, verbose)
+    return _ssh_run_command(entry, opts, opts.command,
+                            alternate_mac_command(opts.command), verbose)
 
 
 def ssh_fetch_arp_table(entry: SwitchEntry, opts: SshOptions, verbose: bool = False) -> str:

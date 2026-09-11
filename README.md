@@ -58,7 +58,7 @@ pip3 install paramiko                 # ya da: apt install python3-paramiko
 cp inventory.csv.example inventory.csv
 $EDITOR inventory.csv
 
-# 3) Test (ag gerektirmez, 93 test)
+# 3) Test (ag gerektirmez, 98 test)
 python3 mac_tracker.py --selftest
 ```
 
@@ -258,7 +258,9 @@ export MACTRACK_SSH_PASS='...'
 export MACTRACK_SSH_ENABLE='...'          # gerekiyorsa enable parolasi
 python3 mac_tracker.py --once -v --collector ssh --ssh-user admin
 
-# Eski IOS'larda komut tireli:
+# Eski IOS'larda komut tireli. Cihaz '% Invalid input' derse arac zaten
+# tireli/bosluklu diger sozdizimini kendisi dener; bu bayrak sadece bastan
+# secmek icin.
 python3 mac_tracker.py --once --collector ssh --ssh-user admin --ssh-command "show mac-address-table"
 ```
 
@@ -318,7 +320,7 @@ python3 mac_tracker.py --selftest              # ya da
 python3 -m unittest discover -s tests -t . -v
 ```
 
-93 test; hicbiri gercek switch gerektirmez. SNMP katmani sahte `snmp_walk`
+98 test; hicbiri gercek switch gerektirmez. SNMP katmani sahte `snmp_walk`
 ile, SSH katmani sahte `ssh_fetch_mac_table` / `ssh_fetch_arp_table` ile,
 veritabani katmani `:memory:` DB ile test edilir. `show mac address-table` ve
 `show ip arp` parse testleri gercek cihaz ciktilarindan alinmis fixture'lar
