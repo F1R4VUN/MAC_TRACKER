@@ -15,6 +15,18 @@ NE YAPAR
           bu portta aktifti" bilgisi tam olarak budur.
         * Cihaz port degistirdiginde bu hareket mac_moves tablosuna yazilir.
 
+IP ILE ARAMA (ARP)
+    Elinde MAC degil IP varsa zincir sudur:
+        IP --(gateway'in ARP tablosu)--> MAC --(switch FDB'si)--> switch + port
+    ARP router'i ASMAZ, tek yaptigi IP'yi MAC'e cevirmektir; cihazin kendi
+    segmentindeki switch yine envanterde olmak zorundadir. ARP tablosu ancak
+    o subnet'in gateway'inde (router ya da SVI'li L3 switch) olusur, bu yuzden
+    o cihaz envanterde 'role=router' (ya da hem switch hem gateway ise
+    'role=both') ile tanimlanmalidir.
+
+        python mac_tracker.py --lookup-ip 10.10.10.20
+        python mac_tracker.py --ip-history 10.10.10.20
+
 VERITABANI HAKKINDA
     SQLite bir sunucu DEGIL, sadece bir dosya. Ayri kurulum/servis gerekmez.
     --db ile verdigin dosya yoksa otomatik olusturulur, tablolar/index'ler
@@ -60,12 +72,15 @@ ZAMAN DAMGALARI
 
 KULLANIM
     1) Envanter dosyasi (inventory.csv):
-         switch,community,vlans,label
-         10.1.1.1,public,,Kat1-SW
-         10.1.2.1,public,1;10;20,Kat2-SW-Eski
+         switch,community,vlans,label,version,role
+         10.1.1.1,public,,Kat1-SW,2c,switch
+         10.1.2.1,public,1;10;20,Kat2-SW-Eski,2c,switch
+         10.1.0.1,public,,Gateway,2c,router
 
        'vlans' dot1q modunda bos birakilabilir (bos = tum VLAN'lar).
        dot1d/Cisco modunda taranacak VLAN'lari ';' ile yaz.
+       'role' (varsayilan switch): switch = MAC tablosu, router = ARP
+       tablosu, both = ikisi birden.
 
     2) Ilk deneme (hatalari gormek icin tek seferlik + ayrintili cikti):
          python mac_tracker.py --once -v
@@ -88,6 +103,10 @@ KULLANIM
     5) Cihazin gecmisi (hangi switch/portlarda dolasti):
          python mac_tracker.py --history AA:BB:CC:DD:EE:FF
 
+       Elinde MAC degil IP varsa (envanterde role=router bir cihaz sart):
+         python mac_tracker.py --lookup-ip 10.10.10.20
+         python mac_tracker.py --ip-history 10.10.10.20
+
     6) Bir portta ne var / bir switch'te neler var:
          python mac_tracker.py --port Gi1/0/5
          python mac_tracker.py --port Gi1/0/5 --switch Kat1-SW
@@ -106,6 +125,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import ipaddress
 import os
 import re
 import shutil
@@ -118,7 +138,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # ---------------------------------------------------------------------------
 # OID sabitleri
@@ -130,6 +150,12 @@ OID_DOT1Q_FDB_PORT = "1.3.6.1.2.1.17.7.1.2.2.1.2"        # Q-BRIDGE: vlan+mac ->
 OID_DOT1Q_FDB_STATUS = "1.3.6.1.2.1.17.7.1.2.2.1.3"      # Q-BRIDGE: vlan+mac -> status
 OID_DOT1D_FDB_PORT = "1.3.6.1.2.1.17.4.3.1.2"            # BRIDGE: mac -> bridge-port
 OID_DOT1D_FDB_STATUS = "1.3.6.1.2.1.17.4.3.1.3"          # BRIDGE: mac -> status
+
+# ARP tablosu (IP-MIB). Index: ifIndex + IPv4 adresi.
+OID_IPNETTOMEDIA_PHYS = "1.3.6.1.2.1.4.22.1.2"           # ARP: ifIndex+ip -> MAC
+OID_IPNETTOMEDIA_TYPE = "1.3.6.1.2.1.4.22.1.4"           # ARP: ifIndex+ip -> tur
+
+ARP_TYPE_INVALID = 2     # other(1) invalid(2) dynamic(3) static(4)
 
 FDB_STATUS_LEARNED = 3   # other(1) invalid(2) learned(3) self(4) mgmt(5)
 
@@ -246,6 +272,60 @@ def mac_from_oid_suffix(oid: str, with_vlan: bool = False) -> tuple[int | None, 
     return vlan, ":".join(f"{b:02X}" for b in mac_bytes)
 
 
+def normalize_ip(text: str) -> str:
+    """
+    IPv4 adresini dogrular ve standart yazimina cevirir.
+    Gecersizse ValueError firlatir -- yanlis yazilmis bir IP'nin sessizce
+    "kayit yok" cevabi donmesini engeller.
+    """
+    cleaned = text.strip()
+    try:
+        address = ipaddress.IPv4Address(cleaned)
+    except ValueError as exc:
+        raise ValueError(f"Gecersiz IPv4 adresi: {text!r}") from exc
+    return str(address)
+
+
+def mac_from_snmp_value(value: str) -> str:
+    """
+    ipNetToMediaPhysAddress degerini MAC'e cevirir. net-snmp bu alani MIB
+    yuklu ise 'aa:bb:cc:dd:ee:ff', yuklu degilse 'AA BB CC DD EE FF' basar;
+    ikisini de kabul eder. Cevrilemezse ValueError.
+    """
+    return normalize_mac(value)
+
+
+def ip_from_arp_oid(oid: str) -> str:
+    """
+    ipNetToMediaPhysAddress OID index'inden IPv4 adresini cikarir. Index
+    'ifIndex + 4 adres byte'i' seklindedir, yani adres son 4 alt-tanimlayici:
+        .1.3.6.1.2.1.4.22.1.2.3.192.168.1.10 -> '192.168.1.10'
+    """
+    parts = oid.strip().lstrip(".").split(".")
+    if len(parts) < 5:
+        raise ValueError(f"ARP OID'inde yeterli alt-tanimlayici yok: {oid!r}")
+    tail = parts[-4:]
+    try:
+        numbers = [int(p) for p in tail]
+    except ValueError as exc:
+        raise ValueError(f"ARP OID suffix'i sayisal degil: {oid!r}") from exc
+    if any(b < 0 or b > 255 for b in numbers):
+        raise ValueError(f"ARP OID suffix'i gecerli IP byte'lari degil: {oid!r}")
+    return ".".join(str(b) for b in numbers)
+
+
+def arp_index_from_oid(oid: str) -> tuple[int | None, str]:
+    """
+    ipNetToMedia OID index'inden (ifIndex, IPv4) cikarir:
+        .1.3.6.1.2.1.4.22.1.2.3.192.168.1.10 -> (3, '192.168.1.10')
+    ifIndex arayuz adini cozmek icin kullanilir; cozulemezse None doner.
+    """
+    ip = ip_from_arp_oid(oid)
+    parts = oid.strip().lstrip(".").split(".")
+    ifindex = safe_int(parts[-5]) if len(parts) >= 5 else None
+    return ifindex, ip
+
+
 def looks_like_snmp_error(value: str) -> bool:
     return any(marker.lower() in value.lower() for marker in SNMP_ERROR_MARKERS)
 
@@ -293,10 +373,21 @@ class SwitchEntry:
     version: str = "2c"                           # "2c" | "3"
     ssh_user: str = ""                            # SSH toplayicisi icin (opsiyonel)
     ssh_pass: str = ""                            # tercihen envantere degil ortama koy
+    role: str = "switch"                          # switch | router | both
 
     def __post_init__(self):
         if not self.label:
             self.label = self.switch
+
+    @property
+    def collects_macs(self) -> bool:
+        """MAC adres tablosu (FDB) okunacak mi -- yani bu cihaz bir switch mi."""
+        return self.role in ("switch", "both")
+
+    @property
+    def collects_arp(self) -> bool:
+        """ARP tablosu okunacak mi -- yani bu cihaz bir gateway/router mu."""
+        return self.role in ("router", "both")
 
 
 @dataclass
@@ -305,6 +396,26 @@ class Observation:
     mac: str
     vlan: int          # bilinmiyorsa 0
     port: str          # "Gi1/0/5" ya da cozulemezse "bridgeport12"
+
+
+@dataclass
+class ArpEntry:
+    """Bir router/L3 switch'in ARP tablosundaki tek bir IP -> MAC eslemesi."""
+    ip: str
+    mac: str
+    interface: str = ""   # 'Vlan10' -- hangi arayuzde cozuldugu (bilgi amacli)
+
+
+@dataclass
+class ArpResult:
+    entry: SwitchEntry
+    arps: list[ArpEntry] = field(default_factory=list)
+    mode_used: str = ""
+    error: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return not self.error
 
 
 @dataclass
@@ -324,56 +435,77 @@ class SwitchResult:
 def parse_inventory_csv(path: str) -> list[SwitchEntry]:
     """
     inventory.csv formati (baslik satiri zorunlu):
-        switch,community,vlans[,label][,version]
+        switch,community,vlans[,label][,version][,role]
         10.1.1.1,public,,Kat1-SW
         10.1.2.1,public,1;10;20,Kat2-SW,2c
+        10.1.0.1,public,,Gateway,2c,router
     'vlans' ';' ile ayrilmis VLAN listesi; dot1q modunda bos birakilabilir.
-    '#' ile baslayan satirlar ve bos satirlar atlanir.
+    'role' cihazdan ne okunacagini belirler (varsayilan 'switch'):
+        switch -> MAC adres tablosu (hangi port)
+        router -> ARP tablosu (hangi IP hangi MAC'te)
+        both   -> ikisi birden (ornegin SVI'li bir L3 switch)
+    '#' ile baslayan satirlar ve bos satirlar atlanir -- baslik satirindan
+    once gelenler dahil, yani dosyanin basina aciklama blogu konabilir.
     """
     entries: list[SwitchEntry] = []
     with open(path, newline="", encoding="utf-8-sig") as handle:
-        reader = csv.DictReader(handle)
-        if reader.fieldnames is None:
-            raise ValueError(f"{path}: dosya bos ya da baslik satiri yok.")
-        headers = {(h or "").strip().lower() for h in reader.fieldnames}
-        if "switch" not in headers:
-            raise ValueError(
-                f"{path}: 'switch' kolonu yok. Beklenen baslik: "
-                f"switch,community,vlans[,label][,version] -- bulunan: {reader.fieldnames}"
-            )
-        for lineno, row in enumerate(reader, start=2):
-            row = {(k or "").strip().lower(): (v or "").strip() for k, v in row.items()}
-            host = row.get("switch", "")
-            if not host or host.startswith("#"):
+        # Yorum ve bos satirlar BASLIKTAN ONCE de ayiklanir: aksi halde
+        # dosyanin basindaki '#' blogu baslik satiri sanilir ve dosya
+        # "'switch' kolonu yok" diye reddedilir.
+        numbered = [(lineno, line) for lineno, line in enumerate(handle, start=1)
+                    if line.strip() and not line.lstrip().startswith("#")]
+
+    reader = csv.DictReader(line for _, line in numbered)
+    if reader.fieldnames is None:
+        raise ValueError(f"{path}: dosya bos ya da baslik satiri yok.")
+    headers = {(h or "").strip().lower() for h in reader.fieldnames}
+    if "switch" not in headers:
+        raise ValueError(
+            f"{path}: 'switch' kolonu yok. Beklenen baslik: "
+            f"switch,community,vlans[,label][,version][,role] -- bulunan: {reader.fieldnames}"
+        )
+    # numbered[0] baslik satiridir; geri kalani veri satirlaridir. Satir
+    # numarasi dosyadaki GERCEK numaradir, boylece hata mesaji atlanmis
+    # yorum satirlari yuzunden yanlis yeri gostermez.
+    for (lineno, _), row in zip(numbered[1:], reader):
+        row = {(k or "").strip().lower(): (v or "").strip() for k, v in row.items()}
+        host = row.get("switch", "")
+        if not host:
+            continue
+        vlans: list[int] = []
+        for token in row.get("vlans", "").replace(",", ";").split(";"):
+            token = token.strip()
+            if not token:
                 continue
-            vlans: list[int] = []
-            for token in row.get("vlans", "").replace(",", ";").split(";"):
-                token = token.strip()
-                if not token:
-                    continue
-                try:
-                    vlan = int(token)
-                except ValueError as exc:
-                    raise ValueError(
-                        f"{path}:{lineno}: '{token}' gecerli bir VLAN ID degil."
-                    ) from exc
-                if not 1 <= vlan <= 4094:
-                    raise ValueError(f"{path}:{lineno}: VLAN {vlan} 1-4094 araliginda degil.")
-                vlans.append(vlan)
-            version = (row.get("version") or "2c").lower().replace("v", "") or "2c"
-            if version not in ("2c", "3"):
-                raise ValueError(f"{path}:{lineno}: desteklenmeyen SNMP surumu: {version!r} (2c ya da 3)")
-            entries.append(
-                SwitchEntry(
-                    switch=host,
-                    community=row.get("community", ""),
-                    vlans=vlans,
-                    label=row.get("label", ""),
-                    version=version,
-                    ssh_user=row.get("ssh_user", ""),
-                    ssh_pass=row.get("ssh_pass", ""),
-                )
+            try:
+                vlan = int(token)
+            except ValueError as exc:
+                raise ValueError(
+                    f"{path}:{lineno}: '{token}' gecerli bir VLAN ID degil."
+                ) from exc
+            if not 1 <= vlan <= 4094:
+                raise ValueError(f"{path}:{lineno}: VLAN {vlan} 1-4094 araliginda degil.")
+            vlans.append(vlan)
+        version = (row.get("version") or "2c").lower().replace("v", "") or "2c"
+        if version not in ("2c", "3"):
+            raise ValueError(f"{path}:{lineno}: desteklenmeyen SNMP surumu: {version!r} (2c ya da 3)")
+        role = (row.get("role") or "switch").lower()
+        if role not in ("switch", "router", "both"):
+            raise ValueError(
+                f"{path}:{lineno}: gecersiz role: {role!r} (switch, router ya da both)"
             )
+        entries.append(
+            SwitchEntry(
+                switch=host,
+                community=row.get("community", ""),
+                vlans=vlans,
+                label=row.get("label", ""),
+                version=version,
+                ssh_user=row.get("ssh_user", ""),
+                ssh_pass=row.get("ssh_pass", ""),
+                role=role,
+            )
+        )
     if not entries:
         raise ValueError(f"{path}: icinde kullanilabilir switch satiri bulunamadi.")
     return entries
@@ -430,6 +562,7 @@ CREATE TABLE IF NOT EXISTS poll_runs (
     started_at  TEXT    NOT NULL,
     finished_at TEXT    NOT NULL,
     ok          INTEGER NOT NULL,
+    kind        TEXT    NOT NULL DEFAULT 'mac',   -- 'mac' (FDB) | 'arp'
     mode_used   TEXT    NOT NULL DEFAULT '',
     observed    INTEGER NOT NULL DEFAULT 0,
     recorded    INTEGER NOT NULL DEFAULT 0,
@@ -438,11 +571,47 @@ CREATE TABLE IF NOT EXISTS poll_runs (
 );
 CREATE INDEX IF NOT EXISTS idx_runs_switch ON poll_runs(switch, started_at DESC);
 
+-- Bir router/L3 switch'in ARP tablosunda gorulen IP -> MAC eslemesi.
+-- mac_locations ile ayni mantik: esleme degismedikce yeni satir ACILMAZ,
+-- last_seen guncellenir. IP baska bir MAC'e gecerse (DHCP yeniden dagitimi,
+-- cihaz degisimi) yeni bir satir olusur ve eskisi gecmis olarak kalir.
+CREATE TABLE IF NOT EXISTS arp_sightings (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ip          TEXT    NOT NULL,
+    mac         TEXT    NOT NULL,
+    source      TEXT    NOT NULL,          -- ARP'i okudugumuz cihazin label'i
+    source_ip   TEXT    NOT NULL DEFAULT '',
+    interface   TEXT    NOT NULL DEFAULT '',  -- 'Vlan10'
+    first_seen  TEXT    NOT NULL,
+    last_seen   TEXT    NOT NULL,
+    seen_count  INTEGER NOT NULL DEFAULT 1
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_arp_sighting
+    ON arp_sightings(ip, mac, source);
+CREATE INDEX IF NOT EXISTS idx_arp_ip ON arp_sightings(ip, last_seen DESC);
+CREATE INDEX IF NOT EXISTS idx_arp_mac ON arp_sightings(mac, last_seen DESC);
+
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
 """
+
+
+def migrate_db(conn: sqlite3.Connection) -> list[str]:
+    """
+    Daha eski bir surumle acilmis veritabanina sonradan eklenen kolonlari
+    ekler. 'CREATE TABLE IF NOT EXISTS' var olan tabloyu degistirmedigi icin
+    gerekli. Eklenen kolon adlarini doner (test ve -v ciktisi icin).
+    """
+    applied: list[str] = []
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(poll_runs)")}
+    if columns and "kind" not in columns:
+        conn.execute("ALTER TABLE poll_runs ADD COLUMN kind TEXT NOT NULL DEFAULT 'mac'")
+        applied.append("poll_runs.kind")
+    if applied:
+        conn.commit()
+    return applied
 
 
 def init_db(db_path: str, must_exist: bool = False) -> sqlite3.Connection:
@@ -464,6 +633,7 @@ def init_db(db_path: str, must_exist: bool = False) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(SCHEMA)
+    migrate_db(conn)
     conn.execute(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -609,26 +779,108 @@ def apply_switch_result(conn: sqlite3.Connection, result: SwitchResult,
 
 def record_poll_run(conn: sqlite3.Connection, result: SwitchResult, started_at: str,
                     recorded: int, uplinks: int) -> None:
+    _insert_poll_run(
+        conn, entry=result.entry, started_at=started_at, ok=result.ok, kind="mac",
+        mode_used=result.mode_used, observed=len(result.observations),
+        recorded=recorded, uplinks=uplinks, error=result.error,
+    )
+
+
+def record_arp_run(conn: sqlite3.Connection, result: ArpResult, started_at: str,
+                   recorded: int) -> None:
+    """ARP okumasi da poll_runs'a yazilir; kind='arp' ile MAC pollundan ayrilir."""
+    _insert_poll_run(
+        conn, entry=result.entry, started_at=started_at, ok=result.ok, kind="arp",
+        mode_used=result.mode_used, observed=len(result.arps),
+        recorded=recorded, uplinks=0, error=result.error,
+    )
+
+
+def _insert_poll_run(conn: sqlite3.Connection, entry: SwitchEntry, started_at: str,
+                     ok: bool, kind: str, mode_used: str, observed: int,
+                     recorded: int, uplinks: int, error: str) -> None:
     conn.execute(
-        "INSERT INTO poll_runs (switch, switch_ip, started_at, finished_at, ok, mode_used, "
-        "observed, recorded, uplinks, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO poll_runs (switch, switch_ip, started_at, finished_at, ok, kind, "
+        "mode_used, observed, recorded, uplinks, error) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
-            result.entry.label, result.entry.switch, started_at, now_utc(),
-            1 if result.ok else 0, result.mode_used,
-            len(result.observations), recorded, uplinks, result.error[:500],
+            entry.label, entry.switch, started_at, now_utc(),
+            1 if ok else 0, kind, mode_used, observed, recorded, uplinks, error[:500],
         ),
     )
     conn.commit()
 
 
-def last_successful_poll(conn: sqlite3.Connection, switch: str) -> str | None:
+def last_successful_poll(conn: sqlite3.Connection, switch: str,
+                         kind: str = "mac") -> str | None:
+    """
+    Bu cihazin en son BASARILI pollu. kind='mac' varsayilandir: cihaz durumu
+    ("koptu mu, switch'e mi ulasamiyoruz") yalnizca MAC tablosu okumalarina
+    bakmalidir -- ARP okumasinin basarili olmasi FDB'nin okundugu anlamina
+    gelmez.
+    """
     cur = conn.execute(
-        "SELECT started_at FROM poll_runs WHERE switch = ? AND ok = 1 "
+        "SELECT started_at FROM poll_runs WHERE switch = ? AND ok = 1 AND kind = ? "
         "ORDER BY started_at DESC LIMIT 1",
-        (switch,),
+        (switch, kind),
     )
     row = cur.fetchone()
     return row["started_at"] if row else None
+
+
+def upsert_arp_sighting(conn: sqlite3.Connection, ip: str, mac: str, source: str,
+                        source_ip: str, interface: str, timestamp: str) -> None:
+    conn.execute(
+        """
+        INSERT INTO arp_sightings
+            (ip, mac, source, source_ip, interface, first_seen, last_seen, seen_count)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+        ON CONFLICT(ip, mac, source) DO UPDATE SET
+            last_seen  = excluded.last_seen,
+            source_ip  = excluded.source_ip,
+            interface  = excluded.interface,
+            seen_count = seen_count + 1
+        """,
+        (ip, mac, source, source_ip, interface, timestamp, timestamp),
+    )
+
+
+def apply_arp_results(conn: sqlite3.Connection, results: list[ArpResult],
+                      timestamp: str) -> dict[str, int]:
+    """ARP sonuclarini DB'ye yazar. Doner: cihaz label -> kaydedilen esleme sayisi."""
+    stats: dict[str, int] = {}
+    for result in results:
+        if not result.ok:
+            continue
+        for arp in result.arps:
+            upsert_arp_sighting(
+                conn, ip=arp.ip, mac=arp.mac, source=result.entry.label,
+                source_ip=result.entry.switch, interface=arp.interface,
+                timestamp=timestamp,
+            )
+        stats[result.entry.label] = len(result.arps)
+    conn.commit()
+    return stats
+
+
+def current_mac_for_ip(conn: sqlite3.Connection, ip: str) -> sqlite3.Row | None:
+    """Bir IP'nin en son gorulen MAC eslemesi."""
+    cur = conn.execute(
+        "SELECT * FROM arp_sightings WHERE ip = ? "
+        "ORDER BY last_seen DESC, seen_count DESC, id DESC LIMIT 1",
+        (ip,),
+    )
+    return cur.fetchone()
+
+
+def current_ip_for_mac(conn: sqlite3.Connection, mac: str) -> sqlite3.Row | None:
+    """Bir MAC'in en son gorulen IP eslemesi (--lookup ciktisini zenginlestirir)."""
+    cur = conn.execute(
+        "SELECT * FROM arp_sightings WHERE mac = ? "
+        "ORDER BY last_seen DESC, seen_count DESC, id DESC LIMIT 1",
+        (mac,),
+    )
+    return cur.fetchone()
 
 
 # ---------------------------------------------------------------------------
@@ -909,6 +1161,60 @@ def collect_switch(entry: SwitchEntry, opts: SnmpOptions, mode: str,
     return result
 
 
+def arp_snmp(entry: SwitchEntry, opts: SnmpOptions,
+             ifnames: dict[int, str]) -> list[ArpEntry]:
+    """
+    IP-MIB ipNetToMediaPhysAddress: ifIndex+IP -> MAC. Tek walk butun ARP
+    tablosunu verir; Q-BRIDGE'den farkli olarak L3 calisan hemen her cihazda
+    desteklenir.
+    """
+    types: dict[str, int] = {}
+    try:
+        for oid, value in snmp_walk(entry, opts, OID_IPNETTOMEDIA_TYPE):
+            kind = safe_int(value)
+            if kind is not None:
+                types[".".join(oid.strip().lstrip(".").split(".")[-5:])] = kind
+    except SnmpError:
+        types = {}          # tur tablosu okunamazsa filtre yapmadan devam et
+
+    arps: list[ArpEntry] = []
+    for oid, value in snmp_walk(entry, opts, OID_IPNETTOMEDIA_PHYS):
+        try:
+            ifindex, ip = arp_index_from_oid(oid)
+            mac = mac_from_snmp_value(value)
+            ip = normalize_ip(ip)
+        except ValueError:
+            continue
+        index = ".".join(oid.strip().lstrip(".").split(".")[-5:])
+        if types.get(index) == ARP_TYPE_INVALID:
+            continue
+        interface = ifnames.get(ifindex, "") if ifindex is not None else ""
+        arps.append(ArpEntry(ip=ip, mac=mac, interface=interface))
+    return arps
+
+
+def collect_arp_snmp(entry: SwitchEntry, opts: SnmpOptions,
+                     verbose: bool = False) -> ArpResult:
+    """Bir router/L3 switch'in ARP tablosunu SNMP ile okur. DB'ye dokunmaz."""
+    result = ArpResult(entry=entry, mode_used="arp-snmp")
+    try:
+        ifnames = get_ifname_map(entry, opts)
+        arps = arp_snmp(entry, opts, ifnames)
+        if not arps:
+            raise SnmpError(
+                "ARP tablosu bos donduruldu "
+                "(IP-MIB destegi ya da SNMP view ayarlarini kontrol et)"
+            )
+        if verbose:
+            print(f"  [{entry.label}] SNMP ARP: {len(arps)} esleme")
+        result.arps = arps
+    except SnmpError as exc:
+        result.error = str(exc)
+    except Exception as exc:
+        result.error = f"{type(exc).__name__}: {exc}"
+    return result
+
+
 # ---------------------------------------------------------------------------
 # 4b) SSH KATMANI -- Cisco IOS 'show mac address-table' (SNMP alternatifi)
 # ---------------------------------------------------------------------------
@@ -934,6 +1240,24 @@ MAC_TABLE_LINE_RE = re.compile(
 # Cihaz gercek bir port degil, dahili bir hedef gosterdiginde
 NON_PORT_TOKENS = {"cpu", "router", "switch", "drop", "n/a", "-", "vl1"}
 
+# 'show ip arp' satiri. Uc formati da tolere eder:
+#   IOS/IOS-XE : Internet  192.168.1.20   12   0050.7966.6801  ARPA   Vlan10
+#   NX-OS      : 10.1.1.10       00:02:11  0050.7966.6802  Vlan10
+ARP_TABLE_LINE_RE = re.compile(
+    r"^\s*[*+#]?\s*(?:Internet\s+)?"
+    r"(?P<ip>\d{1,3}(?:\.\d{1,3}){3})\s+"
+    r"(?P<rest>\S.*)$"
+)
+
+# Satirin herhangi bir yerindeki MAC (Cisco noktali ya da iki nokta/tire ayrilmis)
+MAC_TOKEN_RE = re.compile(
+    r"[0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4}"
+    r"|[0-9a-fA-F]{2}(?:[:-][0-9a-fA-F]{2}){5}"
+)
+
+# ARP satirinda arayuz adi olmayan, atlanmasi gereken token'lar
+ARP_NOISE_TOKENS = {"arpa", "snap", "sap", "srp-a", "srp-b", "-", "*", "+", "#"}
+
 
 @dataclass
 class SshOptions:
@@ -944,6 +1268,7 @@ class SshOptions:
     port: int = 22
     timeout: int = 20
     command: str = "show mac address-table"
+    arp_command: str = "show ip arp"
 
 
 def parse_mac_address_table(text: str) -> list[Observation]:
@@ -976,6 +1301,41 @@ def parse_mac_address_table(text: str) -> list[Observation]:
     return observations
 
 
+def parse_ip_arp_table(text: str) -> list[ArpEntry]:
+    """
+    'show ip arp' ciktisini ArpEntry listesine cevirir.
+
+    ARP router'i asmaz; yaptigi tek sey IP -> MAC cevirisidir. MAC'in hangi
+    switch portunda oldugu bilgisi yine FDB'den gelir, yani cihazin kendi
+    segmentindeki switch envanterde olmak zorundadir.
+
+    'Incomplete' kayitlar (cozulememis ARP istekleri) atlanir: o IP'nin bir
+    MAC'i oldugu anlamina gelmezler.
+    """
+    entries: list[ArpEntry] = []
+    for line in text.splitlines():
+        match = ARP_TABLE_LINE_RE.match(line)
+        if not match:
+            continue
+        rest = match.group("rest")
+        mac_match = MAC_TOKEN_RE.search(rest)
+        if not mac_match:                      # Incomplete / cozulmemis kayit
+            continue
+        try:
+            ip = normalize_ip(match.group("ip"))
+            mac = normalize_mac(mac_match.group(0))
+        except ValueError:
+            continue
+        interface = ""
+        for token in rest[mac_match.end():].split():
+            if token.lower() in ARP_NOISE_TOKENS:
+                continue
+            interface = token
+            break
+        entries.append(ArpEntry(ip=ip, mac=mac, interface=interface))
+    return entries
+
+
 def _read_until_idle(channel, idle: float = 1.0, total: float = 20.0) -> str:
     """Kanaldan veri akisi durana kadar oku. IOS prompt'u cesitlilik gosterdigi
     icin prompt yakalamak yerine 'sessizlik' beklemek daha saglam."""
@@ -994,11 +1354,44 @@ def _read_until_idle(channel, idle: float = 1.0, total: float = 20.0) -> str:
     return "".join(buffer)
 
 
+def alternate_mac_command(command: str) -> str | None:
+    """
+    'show mac address-table' <-> 'show mac-address-table' arasinda gecis yapar:
+    eski IOS'lar tireli sozdizimini ister, yenileri bosluklu olani. Komutun
+    geri kalani korunur, boylece 'show mac address-table vlan 10' gibi ek
+    argumanli komutlar da dogru alternatifi uretir.
+
+    Taninmayan bir komut icin None doner: kor bir alternatif uretip ayni
+    hatayi ikinci kez almanin anlami yok.
+    """
+    if "mac address-table" in command:
+        return command.replace("mac address-table", "mac-address-table", 1)
+    if "mac-address-table" in command:
+        return command.replace("mac-address-table", "mac address-table", 1)
+    return None
+
+
 def ssh_fetch_mac_table(entry: SwitchEntry, opts: SshOptions, verbose: bool = False) -> str:
     """
     Switch'e SSH ile baglanip MAC adres tablosunu getirir. Ciktiyi ham metin
     olarak doner. Basarisizlikta SnmpError firlatir (ayni hata yolu kullanilsin
     diye; mesajda yontem belirtilir).
+    """
+    return _ssh_run_command(entry, opts, opts.command,
+                            alternate_mac_command(opts.command), verbose)
+
+
+def ssh_fetch_arp_table(entry: SwitchEntry, opts: SshOptions, verbose: bool = False) -> str:
+    """Router/L3 switch'e SSH ile baglanip ARP tablosunu getirir (ham metin)."""
+    return _ssh_run_command(entry, opts, opts.arp_command, None, verbose)
+
+
+def _ssh_run_command(entry: SwitchEntry, opts: SshOptions, command: str,
+                     alternate: str | None = None, verbose: bool = False) -> str:
+    """
+    SSH ile baglanip tek bir 'show' komutu calistirir ve ciktiyi ham metin
+    olarak doner. Komut kabul edilmezse (eski IOS sozdizimi) 'alternate'
+    denenir. Basarisizlikta SnmpError firlatir.
     """
     try:
         import paramiko
@@ -1032,13 +1425,10 @@ def ssh_fetch_mac_table(entry: SwitchEntry, opts: SshOptions, verbose: bool = Fa
         channel.send("terminal length 0\n")
         _read_until_idle(channel, idle=0.5, total=opts.timeout)
 
-        channel.send(opts.command + "\n")
+        channel.send(command + "\n")
         output = _read_until_idle(channel, idle=1.2, total=opts.timeout * 3)
 
-        # Eski IOS'larda komut 'show mac-address-table' (tireli) olabiliyor
-        if "Invalid input" in output or "% Ambiguous" in output:
-            alternate = ("show mac-address-table"
-                         if "-" not in opts.command else "show mac address-table")
+        if alternate and ("Invalid input" in output or "% Ambiguous" in output):
             if verbose:
                 print(f"  [{entry.label}] komut kabul edilmedi, deneniyor: {alternate}")
             channel.send(alternate + "\n")
@@ -1079,29 +1469,69 @@ def collect_switch_ssh(entry: SwitchEntry, opts: SshOptions, uplink_threshold: i
     return result
 
 
+def collect_arp_ssh(entry: SwitchEntry, opts: SshOptions,
+                    verbose: bool = False) -> ArpResult:
+    """SSH ile ARP tablosunu okur. collect_arp_snmp ile ayni ArpResult'i doner."""
+    result = ArpResult(entry=entry, mode_used="arp-ssh")
+    try:
+        text = ssh_fetch_arp_table(entry, opts, verbose)
+        arps = parse_ip_arp_table(text)
+        if not arps:
+            snippet = " | ".join(line.strip() for line in text.splitlines()[-5:] if line.strip())
+            raise SnmpError(f"ARP tablosu bos ya da anlasilamadi. Son satirlar: {snippet[:300]}")
+        if verbose:
+            print(f"  [{entry.label}] SSH ARP: {len(arps)} esleme")
+        result.arps = arps
+    except SnmpError as exc:
+        result.error = str(exc)
+    except Exception as exc:
+        result.error = f"{type(exc).__name__}: {exc}"
+    return result
+
+
 # ---------------------------------------------------------------------------
 # 5) POLL ORKESTRASYONU
 # ---------------------------------------------------------------------------
+
+def _run_parallel(work, items: list, workers: int) -> list:
+    """Cihazlari paralel okur. Tek cihaz ya da workers<=1 ise seri calisir."""
+    if not items:
+        return []
+    if workers > 1 and len(items) > 1:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            return list(pool.map(work, items))
+    return [work(item) for item in items]
+
 
 def poll_once(conn: sqlite3.Connection, entries: list[SwitchEntry], opts: SnmpOptions,
               mode: str, uplink_threshold: int, keep_uplinks: bool,
               filter_learned: bool, workers: int, verbose: bool = False,
               collector: str = "snmp", ssh_opts: SshOptions | None = None) -> dict:
-    """Tum switch'leri (paralel) okur, sonuclari DB'ye yazar, ozet doner."""
+    """
+    Tum cihazlari (paralel) okur, sonuclari DB'ye yazar, ozet doner.
+
+    Envanterdeki 'role' kolonu hangi cihazdan ne okunacagini belirler:
+    switch -> MAC adres tablosu, router -> ARP tablosu, both -> ikisi de.
+    """
     started = now_utc()
-    stats = {"switches": len(entries), "ok": 0, "failed": 0,
-             "observed": 0, "recorded": 0, "uplink_skipped": 0}
+    mac_entries = [e for e in entries if e.collects_macs]
+    arp_entries = [e for e in entries if e.collects_arp]
+    stats = {"switches": len(mac_entries), "ok": 0, "failed": 0,
+             "observed": 0, "recorded": 0, "uplink_skipped": 0,
+             "arp_devices": len(arp_entries), "arp_ok": 0, "arp_failed": 0,
+             "arp_recorded": 0}
 
     def work(entry: SwitchEntry) -> SwitchResult:
         if collector == "ssh":
             return collect_switch_ssh(entry, ssh_opts or SshOptions(), uplink_threshold, verbose)
         return collect_switch(entry, opts, mode, uplink_threshold, filter_learned, verbose)
 
-    if workers > 1 and len(entries) > 1:
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            results = list(pool.map(work, entries))
-    else:
-        results = [work(entry) for entry in entries]
+    def arp_work(entry: SwitchEntry) -> ArpResult:
+        if collector == "ssh":
+            return collect_arp_ssh(entry, ssh_opts or SshOptions(), verbose)
+        return collect_arp_snmp(entry, opts, verbose)
+
+    results = _run_parallel(work, mac_entries, workers)
 
     # Tum switch'ler tek seferde yazilir: hareket tespiti poll'un tamamini gormeli.
     per_switch = apply_poll_results(conn, results, started, keep_uplinks)
@@ -1123,6 +1553,22 @@ def poll_once(conn: sqlite3.Connection, entries: list[SwitchEntry], opts: SnmpOp
             uplink_note = (f", {skipped} kayit uplink portunda atlandi "
                            f"({len(result.uplink_ports)} port)")
         print(f"[{result.entry.label}] {result.mode_used}: {recorded} MAC kaydedildi{uplink_note}")
+
+    # ARP: IP -> MAC eslemesi. Portu FDB verir, bu adim yalnizca IP ile
+    # arama yapabilmek icin gerekli.
+    arp_results = _run_parallel(arp_work, arp_entries, workers)
+    per_device = apply_arp_results(conn, arp_results, started)
+    for result in arp_results:
+        if not result.ok:
+            stats["arp_failed"] += 1
+            print(f"[{result.entry.label}] ARP HATASI: {result.error}", file=sys.stderr)
+            record_arp_run(conn, result, started, recorded=0)
+            continue
+        recorded = per_device.get(result.entry.label, 0)
+        record_arp_run(conn, result, started, recorded=recorded)
+        stats["arp_ok"] += 1
+        stats["arp_recorded"] += recorded
+        print(f"[{result.entry.label}] {result.mode_used}: {recorded} IP->MAC eslemesi kaydedildi")
     return stats
 
 
@@ -1157,6 +1603,10 @@ def cmd_lookup(conn: sqlite3.Connection, mac_text: str, stale_minutes: int) -> N
     print(f"Switch       : {loc['switch']}" + (f" ({loc['switch_ip']})" if loc["switch_ip"] else ""))
     print(f"Port         : {loc['port']}")
     print(f"VLAN         : {loc['vlan'] or '-'}")
+    arp = current_ip_for_mac(conn, mac)
+    if arp is not None:
+        print(f"IP           : {arp['ip']}  (ARP: {arp['source']}, "
+              f"{human_age(arp['last_seen'], now)})")
     print(f"Ilk gorulme  : {fmt_local(loc['first_seen'])}")
     print(f"Son gorulme  : {fmt_local(loc['last_seen'])}  ({human_age(loc['last_seen'], now)})")
     print(f"Gorulme sayisi: {loc['seen_count']} poll")
@@ -1172,6 +1622,67 @@ def cmd_lookup(conn: sqlite3.Connection, mac_text: str, stale_minutes: int) -> N
         print("\nBu MAC ayrica su konumlarda da kayitli (eski yerler / trunk izleri):")
         for row in others:
             print(f"  {fmt_local(row['last_seen'])}  {row['switch']} {row['port']} vlan={row['vlan'] or '-'}")
+
+
+def cmd_lookup_ip(conn: sqlite3.Connection, ip_text: str, stale_minutes: int) -> None:
+    """
+    IP ile arama: IP --(ARP)--> MAC --(FDB)--> switch + port.
+
+    ARP yalnizca IP'yi MAC'e cevirir, router'i asmaz. Cihazin portunu
+    bulabilmek icin cihazin kendi segmentindeki switch de envanterde olmali.
+    """
+    ip = normalize_ip(ip_text)
+    row = current_mac_for_ip(conn, ip)
+    if row is None:
+        print(f"{ip}: ARP kaydi yok.")
+        print("  Bu IP'nin gateway'i (router ya da SVI'li L3 switch) envanterde "
+              "role=router ile tanimli mi, kontrol et.")
+        return
+
+    now = datetime.now(timezone.utc)
+    interface = f" {row['interface']}" if row["interface"] else ""
+    print(f"IP           : {ip}")
+    print(f"MAC          : {row['mac']}")
+    print(f"ARP kaynagi  : {row['source']}{interface}  "
+          f"({human_age(row['last_seen'], now)})")
+
+    known = conn.execute(
+        "SELECT COUNT(DISTINCT mac) AS n FROM arp_sightings WHERE ip = ?", (ip,)
+    ).fetchone()["n"]
+    if known > 1:
+        print(f"  (dikkat: bu IP gecmiste {known} farkli MAC'te goruldu -- "
+              f"'--ip-history {ip}' ile bak)")
+
+    if current_location(conn, row["mac"]) is None:
+        print("\nBu MAC hicbir switch'in MAC tablosunda gorulmedi.")
+        print("  ARP yalnizca IP'yi MAC'e cevirir, router'i asmaz: cihazin kendi")
+        print("  segmentindeki switch de envanterde olmali ve pollenebilmeli.")
+        return
+
+    print()
+    cmd_lookup(conn, row["mac"], stale_minutes)
+
+
+def cmd_ip_history(conn: sqlite3.Connection, ip_text: str) -> None:
+    """Bir IP'nin zaman icinde hangi MAC'lere denk geldigi."""
+    ip = normalize_ip(ip_text)
+    rows = conn.execute(
+        "SELECT * FROM arp_sightings WHERE ip = ? ORDER BY last_seen DESC, id DESC", (ip,)
+    ).fetchall()
+    if not rows:
+        print(f"{ip}: ARP kaydi yok.")
+        return
+    print(f"{ip} -- {len(rows)} ARP kaydi:\n")
+    print(f"{'MAC':<19} {'KAYNAK':<18} {'ARAYUZ':<12} {'ILK GORULME':<26} "
+          f"{'SON GORULME':<26} {'POLL':>7}")
+    print("-" * 114)
+    for row in rows:
+        print(f"{row['mac']:<19} {row['source'][:18]:<18} {row['interface'][:12]:<12} "
+              f"{fmt_local(row['first_seen']):<26} {fmt_local(row['last_seen']):<26} "
+              f"{row['seen_count']:>7}")
+    newest = rows[0]
+    print(f"\nEn son MAC: {newest['mac']}  -- portu icin: "
+          f"--lookup {newest['mac']}")
 
 
 def cmd_history(conn: sqlite3.Connection, mac_text: str) -> None:
@@ -1266,23 +1777,26 @@ def cmd_summary(conn: sqlite3.Connection) -> None:
     macs = conn.execute("SELECT COUNT(DISTINCT mac) AS n FROM mac_locations").fetchone()["n"]
     locs = conn.execute("SELECT COUNT(*) AS n FROM mac_locations").fetchone()["n"]
     moves = conn.execute("SELECT COUNT(*) AS n FROM mac_moves").fetchone()["n"]
+    arps = conn.execute("SELECT COUNT(*) AS n FROM arp_sightings").fetchone()["n"]
+    arp_ips = conn.execute("SELECT COUNT(DISTINCT ip) AS n FROM arp_sightings").fetchone()["n"]
     print(f"Farkli MAC      : {macs}")
     print(f"Konum kaydi     : {locs}")
     print(f"Port degisikligi: {moves}")
+    print(f"ARP eslemesi    : {arps} kayit / {arp_ips} farkli IP")
     rows = conn.execute(
         """
-        SELECT switch, MAX(started_at) AS son, SUM(ok) AS basarili, COUNT(*) AS toplam
-        FROM poll_runs GROUP BY switch ORDER BY switch
+        SELECT switch, kind, MAX(started_at) AS son, SUM(ok) AS basarili, COUNT(*) AS toplam
+        FROM poll_runs GROUP BY switch, kind ORDER BY switch, kind
         """
     ).fetchall()
     if not rows:
         print("\nHenuz hic poll yapilmamis.")
         return
     now = datetime.now(timezone.utc)
-    print(f"\n{'SWITCH':<22} {'SON POLL':<26} {'YAS':<22} BASARILI/TOPLAM")
-    print("-" * 100)
+    print(f"\n{'CIHAZ':<22} {'TUR':<5} {'SON POLL':<26} {'YAS':<22} BASARILI/TOPLAM")
+    print("-" * 106)
     for row in rows:
-        print(f"{row['switch'][:22]:<22} {fmt_local(row['son']):<26} "
+        print(f"{row['switch'][:22]:<22} {row['kind']:<5} {fmt_local(row['son']):<26} "
               f"{human_age(row['son'], now):<22} {row['basarili']}/{row['toplam']}")
     failed = conn.execute(
         "SELECT switch, error, started_at FROM poll_runs WHERE ok = 0 "
@@ -1299,9 +1813,11 @@ def cmd_prune(conn: sqlite3.Connection, days: int) -> None:
     locs = conn.execute("DELETE FROM mac_locations WHERE last_seen < ?", (cutoff,)).rowcount
     moves = conn.execute("DELETE FROM mac_moves WHERE timestamp < ?", (cutoff,)).rowcount
     runs = conn.execute("DELETE FROM poll_runs WHERE started_at < ?", (cutoff,)).rowcount
+    arps = conn.execute("DELETE FROM arp_sightings WHERE last_seen < ?", (cutoff,)).rowcount
     conn.commit()
     conn.execute("VACUUM")
-    print(f"{days} gunden eski kayitlar silindi: {locs} konum, {moves} hareket, {runs} poll kaydi.")
+    print(f"{days} gunden eski kayitlar silindi: {locs} konum, {moves} hareket, "
+          f"{arps} ARP eslemesi, {runs} poll kaydi.")
 
 
 # ---------------------------------------------------------------------------
@@ -1322,6 +1838,10 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--loop", action="store_true", help="Surekli calis, --interval'da bir poll et")
     mode.add_argument("--lookup", metavar="MAC", help="Cihaz hangi portta / koptuysa son ne zaman aktifti")
     mode.add_argument("--history", metavar="MAC", help="Cihazin tum konum gecmisi")
+    mode.add_argument("--lookup-ip", metavar="IP",
+                      help="IP ile ara: IP -> (ARP) MAC -> (FDB) switch + port")
+    mode.add_argument("--ip-history", metavar="IP",
+                      help="Bu IP zaman icinde hangi MAC'lerde goruldu")
     mode.add_argument("--port", metavar="PORT", help="Bu portta gorulen MAC'leri listele")
     mode.add_argument("--list-switch", metavar="SWITCH", help="Bu switch'te gorulen tum MAC'ler")
     mode.add_argument("--stale", type=int, metavar="GUN", help="N gunden beri gorulmeyen cihazlar")
@@ -1370,7 +1890,9 @@ def build_parser() -> argparse.ArgumentParser:
     ssh.add_argument("--ssh-port", type=int, default=22)
     ssh.add_argument("--ssh-timeout", type=int, default=20)
     ssh.add_argument("--ssh-command", default="show mac address-table",
-                     help="Calistirilacak komut (eski IOS: 'show mac-address-table')")
+                     help="MAC tablosu komutu (eski IOS: 'show mac-address-table')")
+    ssh.add_argument("--ssh-arp-command", default="show ip arp",
+                     help="ARP tablosu komutu (role=router cihazlar icin)")
     return parser
 
 
@@ -1382,6 +1904,7 @@ def ssh_options_from_args(args) -> SshOptions:
         port=args.ssh_port,
         timeout=args.ssh_timeout,
         command=args.ssh_command,
+        arp_command=args.ssh_arp_command,
     )
 
 
@@ -1433,10 +1956,17 @@ def run_poll_session(args, loop: bool) -> None:
                 args.keep_uplinks, not args.no_status_filter, args.workers, args.verbose,
                 collector=args.collector, ssh_opts=ssh_opts,
             )
+            arp_note = ""
+            if stats["arp_devices"]:
+                arp_note = (f"; ARP: {stats['arp_ok']}/{stats['arp_devices']} cihaz ok, "
+                            f"{stats['arp_recorded']} IP->MAC"
+                            + (f", {stats['arp_failed']} cihaz HATALI"
+                               if stats["arp_failed"] else ""))
             print(
                 f"Poll bitti: {stats['ok']}/{stats['switches']} switch ok, "
                 f"{stats['recorded']} MAC kaydi, {stats['uplink_skipped']} uplink kaydi atlandi"
                 + (f", {stats['failed']} switch HATALI" if stats["failed"] else "")
+                + arp_note
             )
             if not loop:
                 return
@@ -1459,7 +1989,8 @@ def main(argv: list[str] | None = None) -> int:
     # "kayit yok" deme.
     read_only_commands = {
         "lookup": args.lookup, "history": args.history, "port": args.port,
-        "list_switch": args.list_switch,
+        "list_switch": args.list_switch, "lookup_ip": args.lookup_ip,
+        "ip_history": args.ip_history,
     }
     if any(read_only_commands.values()) or args.summary or args.stale is not None or args.prune is not None:
         conn = init_db(args.db, must_exist=True)
@@ -1468,6 +1999,10 @@ def main(argv: list[str] | None = None) -> int:
                 cmd_lookup(conn, args.lookup, args.stale_minutes)
             elif args.history:
                 cmd_history(conn, args.history)
+            elif args.lookup_ip:
+                cmd_lookup_ip(conn, args.lookup_ip, args.stale_minutes)
+            elif args.ip_history:
+                cmd_ip_history(conn, args.ip_history)
             elif args.port:
                 cmd_port(conn, args.port, args.switch)
             elif args.list_switch:

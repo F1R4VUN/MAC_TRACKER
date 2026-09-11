@@ -7,7 +7,14 @@
 #             dot1d/eski Cisco modunda taranacak VLAN'lari yazmak SART.
 # label     : raporlarda gorunecek ad (bos birakilirsa IP kullanilir)
 # version   : 2c (varsayilan) ya da 3
-switch,community,vlans,label,version
-10.1.1.1,public,,Kat1-SW,2c
-10.1.2.1,public,,Kat2-SW,2c
-10.1.0.1,public,1;10;20;30,Core-SW-Eski,2c
+# role      : cihazdan ne okunacagi (varsayilan: switch)
+#             switch -> MAC adres tablosu: cihaz hangi portta
+#             router -> ARP tablosu: hangi IP hangi MAC'te (--lookup-ip icin)
+#             both   -> ikisi birden; SVI'si olan bir L3 switch icin
+#             ARP tablosu yalnizca o subnet'in gateway'inde olusur; IP ile
+#             arama yapabilmek icin gateway'i buraya role=router ile ekle.
+switch,community,vlans,label,version,role
+10.1.1.1,public,,Kat1-SW,2c,switch
+10.1.2.1,public,,Kat2-SW,2c,switch
+10.1.0.1,public,1;10;20;30,Core-SW-Eski,2c,both
+10.1.0.254,public,,Gateway-RTR,2c,router
